@@ -35,20 +35,30 @@ jobs:
 
       - name: Setup Android Permissions and Manifest
         run: |
-          # Добавляем разрешения
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' android/app/src/main/AndroidManifest.xml || true
           
-          # Добавляем регистрацию VpnService перед закрывающим тегом </application>
+          # Удаляем дубликаты сервиса если были, и прописываем начисто
+          sed -i '/AdLockerVpnService/d' android/app/src/main/AndroidManifest.xml || true
           sed -i '/<\/application>/i \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' android/app/src/main/AndroidManifest.xml
 
-      - name: Write Native Android Kotlin Bridge
+      - name: Overwrite Native Android Activity and VPN Service
         run: |
-          TARGET_DIR="android/app/src/main/kotlin/com/adlocker/app"
-          mkdir -p "$TARGET_DIR"
+          # Находим реальный каталог с MainActivity
+          MAIN_FILE=$(find android/app/src/main -name "MainActivity.kt" -o -name "MainActivity.java" | head -n 1)
+          TARGET_DIR=$(dirname "$MAIN_FILE")
+          
+          # Извлекаем правильный package из существующего файла
+          PKG_LINE=$(grep "^package " "$MAIN_FILE" | head -n 1)
+          if [ -z "$PKG_LINE" ]; then
+            PKG_LINE="package com.adlocker.app.adlocker"
+          fi
+          
+          echo "Found target directory: $TARGET_DIR"
+          echo "Package definition: $PKG_LINE"
 
-          # 1. Сервис VPN
-          cat << 'EOF' > "$TARGET_DIR/AdLockerVpnService.kt"
-          package com.adlocker.app
+          # 1. Записываем AdLockerVpnService.kt
+          cat << EOF > "$TARGET_DIR/AdLockerVpnService.kt"
+          $PKG_LINE
 
           import android.content.Intent
           import android.net.VpnService
@@ -73,9 +83,9 @@ jobs:
                   if (vpnInterface != null) return
                   try {
                       val builder = Builder()
-                      builder.setSession("AdLocker Shield")
+                      builder.setSession("AdLocker")
                       builder.addAddress("10.0.0.2", 32)
-                      // Применяем блокирующий DNS AdGuard (блокирует рекламу на уровне всего устройства)
+                      // Системный блокирующий DNS AdGuard
                       builder.addDnsServer("94.140.14.14")
                       builder.addDnsServer("94.140.15.15")
                       builder.setBlocking(false)
@@ -104,9 +114,10 @@ jobs:
           }
           EOF
 
-          # 2. Главная Activity с MethodChannel
-          cat << 'EOF' > "$TARGET_DIR/MainActivity.kt"
-          package com.adlocker.app
+          # 2. Заменяем MainActivity.kt реальной реализацией канала
+          rm -f "$TARGET_DIR/MainActivity.java"
+          cat << EOF > "$TARGET_DIR/MainActivity.kt"
+          $PKG_LINE
 
           import android.app.Activity
           import android.content.Intent
@@ -203,9 +214,9 @@ jobs:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
           body: |
-            ## AdLocker — System VPN Real Blocker
-            * Добавлен реальный системный VpnService перехватчик.
-            * Фильтрация рекламных доменов на системном уровне.
+            ## AdLocker — System VPN Fix
+            * Точная привязка пакета MainActivity.kt.
+            * Автоматический вызов диалога VPN-соединения.
           files: release_apks/AdLocker.apk
           draft: false
           prerelease: false
