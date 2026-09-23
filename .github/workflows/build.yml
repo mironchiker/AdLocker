@@ -1,0 +1,73 @@
+name: Build and Release AdLocker
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: 'stable'
+
+      - name: Generate Android project structure
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create . --platforms=android --project-name=adlocker --org=com.adlocker.app
+          fi
+
+      - name: Configure Android permissions & SDK
+        run: |
+          # Сетевые разрешения
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' android/app/src/main/AndroidManifest.xml || true
+          
+          # Версии SDK и архитектуры процессоров (для веса ~20-25 МБ)
+          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 23/' android/app/build.gradle || true
+          sed -i 's/minSdk = [0-9]*/minSdk = 23/' android/app/build.gradle || true
+          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' android/app/build.gradle || true
+          sed -i 's/targetSdk = [0-9]*/targetSdk = 34/' android/app/build.gradle || true
+          sed -i '/defaultConfig {/a \        ndk { abiFilters "arm64-v8a", "armeabi-v7a" }' android/app/build.gradle || true
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Single Release APK
+        run: flutter build apk --release --no-shrink
+
+      - name: Prepare APK for Release
+        run: |
+          mkdir -p release_apks
+          cp build/app/outputs/flutter-apk/app-release.apk release_apks/AdLocker.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0-${{ github.run_number }}
+          name: AdLocker v1.0.0 (Build ${{ github.run_number }})
+          body: |
+            ## AdLocker — Shield & Ad Blocker
+            * Релизная сборка APK под Android (ARM64 / ARMv7).
+            * Локальный DNS-перехват и фильтрация рекламы.
+          files: release_apks/AdLocker.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
