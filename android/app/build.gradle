@@ -29,10 +29,6 @@ android {
         jvmTarget = '17'
     }
 
-    sourceSets {
-        main.java.srcDirs += 'src/main/kotlin'
-    }
-
     defaultConfig {
         applicationId "com.adlocker.app.adlocker"
         minSdkVersion 24
@@ -57,7 +53,4 @@ flutter {
 dependencies {
     implementation "androidx.annotation:annotation:1.7.1"
     implementation "androidx.core:core-ktx:1.12.0"
-
-    // Гарантирует наличие Flutter Engine классов для компилятора Kotlin
-    compileOnly "io.flutter:flutter_embedding_release:1.0.0-+"
 }
