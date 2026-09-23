@@ -39,11 +39,11 @@ jobs:
           sed -i '/AdLockerVpnService/d' android/app/src/main/AndroidManifest.xml || true
           sed -i '/<\/application>/i \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' android/app/src/main/AndroidManifest.xml
 
-      - name: Write Native Android Bridge
+      - name: Write Native Kotlin Engine
         run: |
           MAIN_FILE=$(find android/app/src/main -name "MainActivity.kt" -o -name "MainActivity.java" | head -n 1)
           TARGET_DIR=$(dirname "$MAIN_FILE")
-          
+
           PKG_LINE=$(grep "^package " "$MAIN_FILE" | head -n 1)
           if [ -z "$PKG_LINE" ]; then
             PKG_LINE="package com.adlocker.app.adlocker"
@@ -53,26 +53,79 @@ jobs:
           echo "Package: $PKG_LINE"
 
           # 1. AdLockerVpnService.kt
-          cat << EOF > "$TARGET_DIR/AdLockerVpnService.kt"
-          $PKG_LINE
+          cat << 'EOF' > "$TARGET_DIR/AdLockerVpnService.kt"
+          package com.adlocker.app.adlocker
 
           import android.content.Intent
           import android.net.VpnService
+          import android.os.Handler
+          import android.os.Looper
           import android.os.ParcelFileDescriptor
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.nio.ByteBuffer
+          import kotlin.concurrent.thread
 
           class AdLockerVpnService : VpnService() {
+
               companion object {
                   var isRunning = false
+                  var activeRulesCount = 0
+                  var queryListener: ((Map<String, Any>) -> Unit)? = null
               }
+
               private var vpnInterface: ParcelFileDescriptor? = null
+              private var isWorkerRunning = false
+              private val blackList = HashSet<String>()
+              private val whiteList = HashSet<String>()
+              private val mainHandler = Handler(Looper.getMainLooper())
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   if (intent?.action == "STOP") {
                       stopVpn()
                       return START_NOT_STICKY
                   }
+                  loadRules()
                   startVpn()
                   return START_STICKY
+              }
+
+              private fun loadRules() {
+                  thread {
+                      try {
+                          val rulesFile = File(filesDir, "adblock_hosts_rules.txt")
+                          if (rulesFile.exists()) {
+                              val lines = rulesFile.readLines()
+                              synchronized(blackList) {
+                                  blackList.clear()
+                                  for (line in lines) {
+                                      val trimmed = line.trim().lowercase()
+                                      if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+                                          blackList.add(trimmed)
+                                      }
+                                  }
+                                  activeRulesCount = blackList.size
+                              }
+                          }
+                          val wlFile = File(filesDir, "whitelist.txt")
+                          if (wlFile.exists()) {
+                              val lines = wlFile.readLines()
+                              synchronized(whiteList) {
+                                  whiteList.clear()
+                                  for (l in lines) {
+                                      val t = l.trim().lowercase()
+                                      if (t.isNotEmpty()) whiteList.add(t)
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }
               }
 
               private fun startVpn() {
@@ -81,23 +134,12 @@ jobs:
                       val builder = Builder()
                       builder.setSession("AdLocker Shield")
                       builder.setMtu(1500)
-                      builder.addAddress("10.0.0.2", 32)
-                      
-                      // 1. Основной DNS: xbox-dns.ru
-                      builder.addDnsServer("111.88.96.50")
-                      builder.addDnsServer("111.88.96.51")
+                      builder.addAddress("10.233.1.2", 32)
 
-                      // 2. Резервный DNS: AdGuard для фильтрации рекламы
-                      builder.addDnsServer("94.140.14.14")
-                      builder.addDnsServer("94.140.15.15")
+                      builder.addDnsServer("10.233.1.2")
+                      builder.addRoute("10.233.1.2", 32)
 
-                      // Маршрутизируем адреса DNS
-                      builder.addRoute("111.88.96.50", 32)
-                      builder.addRoute("111.88.96.51", 32)
-                      builder.addRoute("94.140.14.14", 32)
-                      builder.addRoute("94.140.15.15", 32)
-
-                      // КРИТИЧЕСКИ ВАЖНО: Разрешаем прямому трафику идти мимо VPN (интернет не падает)
+                      // Прямой доступ для остального интернет-трафика
                       builder.allowBypass()
 
                       try {
@@ -105,15 +147,197 @@ jobs:
                           builder.addDisallowedApplication("com.google.android.googlequicksearchbox")
                       } catch (_: Exception) {}
 
-                      builder.setBlocking(false)
+                      builder.setBlocking(true)
                       vpnInterface = builder.establish()
                       isRunning = true
+                      isWorkerRunning = true
+
+                      startDnsForwarderLoop()
                   } catch (e: Exception) {
                       e.printStackTrace()
+                      stopVpn()
+                  }
+              }
+
+              private fun startDnsForwarderLoop() {
+                  thread(name = "AdLocker-TunWorker") {
+                      val pfd = vpnInterface ?: return@thread
+                      val inStream = FileInputStream(pfd.fileDescriptor)
+                      val outStream = FileOutputStream(pfd.fileDescriptor)
+                      val packetBuffer = ByteArray(32767)
+
+                      val upstreamXbox = InetAddress.getByName("111.88.96.50")
+                      val fallbackAdguard = InetAddress.getByName("94.140.14.14")
+
+                      val forwarderSocket = DatagramSocket()
+                      protect(forwarderSocket)
+                      forwarderSocket.soTimeout = 2000
+
+                      while (isWorkerRunning) {
+                          try {
+                              val length = inStream.read(packetBuffer)
+                              if (length <= 0) continue
+
+                              if ((packetBuffer[0].toInt() shr 4) != 4) continue
+                              if (packetBuffer[9].toInt() != 17) continue
+
+                              val ihl = (packetBuffer[0].toInt() and 0x0F) * 4
+                              val udpDstPort = ((packetBuffer[ihl + 2].toInt() and 0xFF) shl 8) or (packetBuffer[ihl + 3].toInt() and 0xFF)
+
+                              if (udpDstPort == 53) {
+                                  val udpOffset = ihl + 8
+                                  val dnsLength = length - udpOffset
+                                  if (dnsLength < 12) continue
+
+                                  val dnsQuery = ByteArray(dnsLength)
+                                  System.arraycopy(packetBuffer, udpOffset, dnsQuery, 0, dnsLength)
+
+                                  val domain = parseDnsDomain(dnsQuery)
+                                  val isBlocked = shouldBlock(domain)
+
+                                  notifyFlutter(domain, isBlocked)
+
+                                  if (isBlocked) {
+                                      val dnsResponse = craftSinkholeDnsResponse(dnsQuery)
+                                      val fullPacket = craftUdpIpPacket(packetBuffer, ihl, dnsResponse)
+                                      outStream.write(fullPacket)
+                                  } else {
+                                      var responsePayload: ByteArray? = null
+                                      val outDatagram = DatagramPacket(dnsQuery, dnsLength, upstreamXbox, 53)
+
+                                      try {
+                                          forwarderSocket.send(outDatagram)
+                                          val inBuf = ByteArray(4096)
+                                          val inDatagram = DatagramPacket(inBuf, inBuf.size)
+                                          forwarderSocket.receive(inDatagram)
+                                          responsePayload = ByteArray(inDatagram.length)
+                                          System.arraycopy(inBuf, 0, responsePayload, 0, inDatagram.length)
+                                      } catch (_: Exception) {
+                                          try {
+                                              val fbDatagram = DatagramPacket(dnsQuery, dnsLength, fallbackAdguard, 53)
+                                              forwarderSocket.send(fbDatagram)
+                                              val fbBuf = ByteArray(4096)
+                                              val inFb = DatagramPacket(fbBuf, fbBuf.size)
+                                              forwarderSocket.receive(inFb)
+                                              responsePayload = ByteArray(inFb.length)
+                                              System.arraycopy(fbBuf, 0, responsePayload, 0, inFb.length)
+                                          } catch (_: Exception) {}
+                                      }
+
+                                      if (responsePayload != null) {
+                                          val fullPacket = craftUdpIpPacket(packetBuffer, ihl, responsePayload)
+                                          outStream.write(fullPacket)
+                                      }
+                                  }
+                              }
+                          } catch (_: Exception) {}
+                      }
+
+                      try { forwarderSocket.close() } catch (_: Exception) {}
+                  }
+              }
+
+              private fun shouldBlock(domain: String): Boolean {
+                  if (domain.isEmpty()) return false
+                  val d = domain.lowercase()
+                  synchronized(whiteList) {
+                      if (whiteList.contains(d)) return false
+                  }
+                  synchronized(blackList) {
+                      if (blackList.contains(d)) return true
+                      var dotIdx = d.indexOf('.')
+                      while (dotIdx != -1) {
+                          val parent = d.substring(dotIdx + 1)
+                          if (blackList.contains(parent)) return true
+                          dotIdx = d.indexOf('.', dotIdx + 1)
+                      }
+                  }
+                  return false
+              }
+
+              private fun parseDnsDomain(dns: ByteArray): String {
+                  var pos = 12
+                  val sb = StringBuilder()
+                  while (pos < dns.size) {
+                      val len = dns[pos].toInt() and 0xFF
+                      if (len == 0) break
+                      if ((len and 0xC0) == 0xC0) break
+                      pos++
+                      if (pos + len > dns.size) break
+                      if (sb.isNotEmpty()) sb.append(".")
+                      sb.append(String(dns, pos, len, Charsets.US_ASCII))
+                      pos += len
+                  }
+                  return sb.toString()
+              }
+
+              private fun craftSinkholeDnsResponse(query: ByteArray): ByteArray {
+                  val bb = ByteBuffer.allocate(query.size + 16)
+                  bb.put(query[0])
+                  bb.put(query[1])
+                  bb.put(0x81.toByte())
+                  bb.put(0x80.toByte())
+                  bb.putShort(1)
+                  bb.putShort(1)
+                  bb.putShort(0)
+                  bb.putShort(0)
+                  bb.put(query, 12, query.size - 12)
+                  bb.put(0xC0.toByte())
+                  bb.put(0x0C.toByte())
+                  bb.putShort(1)
+                  bb.putShort(1)
+                  bb.putInt(60)
+                  bb.putShort(4)
+                  bb.put(0.toByte())
+                  bb.put(0.toByte())
+                  bb.put(0.toByte())
+                  bb.put(0.toByte())
+
+                  val res = ByteArray(bb.position())
+                  System.arraycopy(bb.array(), 0, res, 0, res.size)
+                  return res
+              }
+
+              private fun craftUdpIpPacket(req: ByteArray, ihl: Int, payload: ByteArray): ByteArray {
+                  val totalLen = 20 + 8 + payload.size
+                  val out = ByteArray(totalLen)
+                  out[0] = 0x45.toByte()
+                  out[1] = 0
+                  out[2] = ((totalLen shr 8) and 0xFF).toByte()
+                  out[3] = (totalLen and 0xFF).toByte()
+                  out[4] = 0
+                  out[5] = 0
+                  out[6] = 0x40.toByte()
+                  out[7] = 0
+                  out[8] = 64
+                  out[9] = 17
+                  System.arraycopy(req, 16, out, 12, 4)
+                  System.arraycopy(req, 12, out, 16, 4)
+                  out[20] = req[ihl + 2]
+                  out[21] = req[ihl + 3]
+                  out[22] = req[ihl]
+                  out[23] = req[ihl + 1]
+                  val udpLen = 8 + payload.size
+                  out[24] = ((udpLen shr 8) and 0xFF).toByte()
+                  out[25] = (udpLen and 0xFF).toByte()
+                  out[26] = 0
+                  out[27] = 0
+                  System.arraycopy(payload, 0, out, 28, payload.size)
+                  return out
+              }
+
+              private fun notifyFlutter(domain: String, isBlocked: Boolean) {
+                  mainHandler.post {
+                      val map = HashMap<String, Any>()
+                      map["domain"] = domain
+                      map["blocked"] = isBlocked
+                      map["time"] = System.currentTimeMillis()
+                      queryListener?.invoke(map)
                   }
               }
 
               private fun stopVpn() {
+                  isWorkerRunning = false
                   try {
                       vpnInterface?.close()
                       vpnInterface = null
@@ -132,25 +356,29 @@ jobs:
           EOF
 
           # 2. MainActivity.kt
-          rm -f "$TARGET_DIR/MainActivity.java"
-          cat << EOF > "$TARGET_DIR/MainActivity.kt"
-          $PKG_LINE
+          cat << 'EOF' > "$TARGET_DIR/MainActivity.kt"
+          package com.adlocker.app.adlocker
 
           import android.app.Activity
           import android.content.Intent
           import android.net.VpnService
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.EventChannel
           import io.flutter.plugin.common.MethodChannel
 
-          class MainActivity: FlutterActivity() {
-              private val CHANNEL = "com.adlocker.app/vpn"
+          class MainActivity : FlutterActivity() {
+
+              private val METHOD_CHANNEL = "com.adlocker.app/vpn"
+              private val EVENT_CHANNEL = "com.adlocker.app/dns_stream"
               private val VPN_REQUEST_CODE = 2026
               private var pendingResult: MethodChannel.Result? = null
+              private var eventSink: EventChannel.EventSink? = null
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL).setMethodCallHandler { call, result ->
                       when (call.method) {
                           "startVpn" -> {
                               val vpnIntent = VpnService.prepare(this)
@@ -172,9 +400,28 @@ jobs:
                           "isVpnActive" -> {
                               result.success(AdLockerVpnService.isRunning)
                           }
+                          "getRulesCount" -> {
+                              result.success(AdLockerVpnService.activeRulesCount)
+                          }
                           else -> result.notImplemented()
                       }
                   }
+
+                  EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
+                      object : EventChannel.StreamHandler {
+                          override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                              eventSink = events
+                              AdLockerVpnService.queryListener = { data ->
+                                  eventSink?.success(data)
+                              }
+                          }
+
+                          override fun onCancel(arguments: Any?) {
+                              eventSink = null
+                              AdLockerVpnService.queryListener = null
+                          }
+                      }
+                  )
               }
 
               private fun startServiceDirectly() {
@@ -201,8 +448,7 @@ jobs:
         run: flutter pub get
 
       - name: Build Single Release APK
-        run: |
-          flutter build apk --release --target-platform=android-arm,android-arm64 --no-shrink
+        run: flutter build apk --release --target-platform=android-arm,android-arm64 --no-shrink
 
       - name: Sign APK (V1 + V2 + V3)
         run: |
@@ -212,7 +458,7 @@ jobs:
             -dname "CN=AdLocker, OU=App, O=AdLocker, L=City, S=State, C=RU"
 
           APKSIGNER=$(find $ANDROID_SDK_ROOT/build-tools -name apksigner | sort -V | tail -n 1)
-          
+
           $APKSIGNER sign --ks release.keystore \
             --ks-key-alias adlocker \
             --ks-pass pass:adlocker123 \
@@ -231,13 +477,12 @@ jobs:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
           body: |
-            ## AdLocker — Full 3-Tab Architecture Fixed
-            * Восстановлены все вкладки и разделы.
-            * DNS: xbox-dns.ru (основной) + AdGuard (резервный).
-            * Интернет стабилен благодаря allowBypass().
+            ## AdLocker — Pure Native DNS Engine
+            * Нативный перехват DNS без разрыва основного интернет-соединения.
+            * Локальный sinkhole 0.0.0.0.
+            * Двусторонний EventChannel для реального потока пакетов.
           files: release_apks/AdLocker.apk
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
