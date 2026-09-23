@@ -27,11 +27,25 @@ jobs:
           flutter-version: '3.22.x'
           channel: 'stable'
 
-      - name: Ensure Android Manifest Permissions
+      - name: Fix Android v2 Embedding and Manifest
         run: |
-          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' android/app/src/main/AndroidManifest.xml || true
-          sed -i '/AdLockerVpnService/d' android/app/src/main/AndroidManifest.xml || true
-          sed -i '/<\/application>/i \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' android/app/src/main/AndroidManifest.xml || true
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          
+          # Убираем старый класс FlutterApplication v1 embedding
+          sed -i 's/android:name="io.flutter.app.FlutterApplication"//g' "$MANIFEST" || true
+          
+          # Убираем устаревший meta-data flutterEmbedding, если он был со значением 1
+          sed -i '/android:name="flutterEmbedding"/d' "$MANIFEST" || true
+          
+          # Добавляем современный v2 embedding
+          sed -i '/<application/a \        <meta-data android:name="flutterEmbedding" android:value="2"/>' "$MANIFEST" || true
+
+          # Добавляем разрешения
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' "$MANIFEST" || true
+          
+          # Регистрируем VpnService
+          sed -i '/AdLockerVpnService/d' "$MANIFEST" || true
+          sed -i '/<\/application>/i \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' "$MANIFEST" || true
 
       - name: Get dependencies
         run: flutter pub get
@@ -54,12 +68,12 @@ jobs:
             --out build/app/outputs/flutter-apk/app-release-signed.apk \
             build/app/outputs/flutter-apk/app-release.apk
 
-      - name: Create Release
+      - name: Release APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
-          body: "Чистый нативный релиз. Физические файлы Kotlin с расчетом IP Checksum по RFC 1071."
+          body: "Исправлена ошибка Android v1 embedding. Полная поддержка v2 embedding."
           files: build/app/outputs/flutter-apk/app-release-signed.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
