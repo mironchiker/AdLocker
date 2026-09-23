@@ -27,6 +27,17 @@ jobs:
           flutter-version: '3.22.x'
           channel: 'stable'
 
+      - name: Ensure Gradle 8.4 Wrapper
+        run: |
+          mkdir -p android/gradle/wrapper
+          cat << 'EOF' > android/gradle/wrapper/gradle-wrapper.properties
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.4-all.zip
+          EOF
+
       - name: Validate AndroidManifest XML
         run: |
           sudo apt-get update && sudo apt-get install -y libxml2-utils
@@ -60,7 +71,7 @@ jobs:
         with:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
-          body: "Релиз AdLocker с проверенным AndroidManifest.xml."
+          body: "Релиз AdLocker собран на Gradle 8.4."
           files: build/app/outputs/flutter-apk/app-release-signed.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
