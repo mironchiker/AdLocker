@@ -33,22 +33,21 @@ jobs:
             flutter create . --platforms=android --project-name=adlocker --org=com.adlocker.app
           fi
 
-      - name: Configure Android Permissions and VPN Service
+      - name: Setup Android Permissions and Manifest
         run: |
-          # Разрешения в манифест
+          # Добавляем разрешения
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' android/app/src/main/AndroidManifest.xml || true
           
-          # Регистрация VpnService в AndroidManifest.xml
-          sed -i '/<\/activity>/a \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' android/app/src/main/AndroidManifest.xml || true
+          # Добавляем регистрацию VpnService перед закрывающим тегом </application>
+          sed -i '/<\/application>/i \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' android/app/src/main/AndroidManifest.xml
 
-      - name: Inject Native Android VPN Bridge
+      - name: Write Native Android Kotlin Bridge
         run: |
-          PACKAGE_DIR="android/app/src/main/kotlin/com/adlocker/app"
-          if [ ! -d "$PACKAGE_DIR" ]; then
-            PACKAGE_DIR=$(find android/app/src/main -type d -name "adlocker" | head -n 1)
-          fi
-          
-          cat << 'EOF' > "$PACKAGE_DIR/AdLockerVpnService.kt"
+          TARGET_DIR="android/app/src/main/kotlin/com/adlocker/app"
+          mkdir -p "$TARGET_DIR"
+
+          # 1. Сервис VPN
+          cat << 'EOF' > "$TARGET_DIR/AdLockerVpnService.kt"
           package com.adlocker.app
 
           import android.content.Intent
@@ -56,6 +55,9 @@ jobs:
           import android.os.ParcelFileDescriptor
 
           class AdLockerVpnService : VpnService() {
+              companion object {
+                  var isRunning = false
+              }
               private var vpnInterface: ParcelFileDescriptor? = null
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -73,11 +75,12 @@ jobs:
                       val builder = Builder()
                       builder.setSession("AdLocker Shield")
                       builder.addAddress("10.0.0.2", 32)
-                      // Заворачиваем системный DNS на публичный DNS AdGuard / Cloudflare с фильтром
-                      builder.addDnsServer("94.140.14.14") 
+                      // Применяем блокирующий DNS AdGuard (блокирует рекламу на уровне всего устройства)
+                      builder.addDnsServer("94.140.14.14")
                       builder.addDnsServer("94.140.15.15")
                       builder.setBlocking(false)
                       vpnInterface = builder.establish()
+                      isRunning = true
                   } catch (e: Exception) {
                       e.printStackTrace()
                   }
@@ -87,6 +90,7 @@ jobs:
                   try {
                       vpnInterface?.close()
                       vpnInterface = null
+                      isRunning = false
                       stopSelf()
                   } catch (e: Exception) {
                       e.printStackTrace()
@@ -100,7 +104,8 @@ jobs:
           }
           EOF
 
-          cat << 'EOF' > "$PACKAGE_DIR/MainActivity.kt"
+          # 2. Главная Activity с MethodChannel
+          cat << 'EOF' > "$TARGET_DIR/MainActivity.kt"
           package com.adlocker.app
 
           import android.app.Activity
@@ -112,7 +117,7 @@ jobs:
 
           class MainActivity: FlutterActivity() {
               private val CHANNEL = "com.adlocker.app/vpn"
-              private val VPN_REQUEST_CODE = 1001
+              private val VPN_REQUEST_CODE = 2026
               private var pendingResult: MethodChannel.Result? = null
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -120,19 +125,24 @@ jobs:
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
                       when (call.method) {
                           "startVpn" -> {
-                              val intent = VpnService.prepare(this)
-                              if (intent != null) {
+                              val vpnIntent = VpnService.prepare(this)
+                              if (vpnIntent != null) {
                                   pendingResult = result
-                                  startActivityForResult(intent, VPN_REQUEST_CODE)
+                                  startActivityForResult(vpnIntent, VPN_REQUEST_CODE)
                               } else {
                                   startServiceDirectly()
                                   result.success(true)
                               }
                           }
                           "stopVpn" -> {
-                              val intent = Intent(this, AdLockerVpnService::class.java).apply { action = "STOP" }
-                              startService(intent)
+                              val stopIntent = Intent(this, AdLockerVpnService::class.java).apply {
+                                  action = "STOP"
+                              }
+                              startService(stopIntent)
                               result.success(true)
+                          }
+                          "isVpnActive" -> {
+                              result.success(AdLockerVpnService.isRunning)
                           }
                           else -> result.notImplemented()
                       }
@@ -140,8 +150,8 @@ jobs:
               }
 
               private fun startServiceDirectly() {
-                  val intent = Intent(this, AdLockerVpnService::class.java)
-                  startService(intent)
+                  val serviceIntent = Intent(this, AdLockerVpnService::class.java)
+                  startService(serviceIntent)
               }
 
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -193,12 +203,11 @@ jobs:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
           body: |
-            ## AdLocker — Shield & Real Ad Blocker
-            * Полноценный нативный Android VpnService.
-            * Хранение базы 70 000+ правил в локальном хранилище.
+            ## AdLocker — System VPN Real Blocker
+            * Добавлен реальный системный VpnService перехватчик.
+            * Фильтрация рекламных доменов на системном уровне.
           files: release_apks/AdLocker.apk
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
