@@ -7,8 +7,9 @@
     <application
         android:label="AdLocker"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@android:drawable/sym_def_app_icon">
 
+        <!-- Ключевой тег для Flutter v2 embedding -->
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
@@ -17,7 +18,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:theme="@style/LaunchTheme"
+            android:theme="@android:style/Theme.Black.NoTitleBar"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
@@ -37,4 +38,3 @@
         </service>
     </application>
 </manifest>
-
