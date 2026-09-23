@@ -27,22 +27,6 @@ jobs:
           flutter-version: '3.22.x'
           channel: 'stable'
 
-      - name: Ensure Gradle 8.4 Wrapper
-        run: |
-          mkdir -p android/gradle/wrapper
-          cat << 'EOF' > android/gradle/wrapper/gradle-wrapper.properties
-          distributionBase=GRADLE_USER_HOME
-          distributionPath=wrapper/dists
-          zipStoreBase=GRADLE_USER_HOME
-          zipStorePath=wrapper/dists
-          distributionUrl=https\://services.gradle.org/distributions/gradle-8.4-all.zip
-          EOF
-
-      - name: Validate AndroidManifest XML
-        run: |
-          sudo apt-get update && sudo apt-get install -y libxml2-utils
-          xmllint --noout android/app/src/main/AndroidManifest.xml
-
       - name: Clean build cache and fetch dependencies
         run: |
           flutter clean
@@ -51,27 +35,49 @@ jobs:
       - name: Build Release APK
         run: flutter build apk --release --target-platform=android-arm,android-arm64 --no-shrink
 
-      - name: Sign APK (V1 + V2 + V3)
+      - name: Sign APK (v1 + v2 + v3)
         run: |
+          # 1. Генерируем релизный ключ
           keytool -genkeypair -v -keystore release.keystore -alias adlocker \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass adlocker123 -keypass adlocker123 \
             -dname "CN=AdLocker, OU=App, O=AdLocker, L=City, S=State, C=RU"
 
-          APKSIGNER=$(find $ANDROID_SDK_ROOT/build-tools -name apksigner | sort -V | tail -n 1)
+          # 2. Находим утилиты сборки Android SDK
+          BUILD_TOOLS_DIR=$(find $ANDROID_SDK_ROOT/build-tools -type d | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+
+          ORIGINAL_APK="build/app/outputs/flutter-apk/app-release-unsigned.apk"
+          if [ ! -f "$ORIGINAL_APK" ]; then
+            ORIGINAL_APK="build/app/outputs/flutter-apk/app-release.apk"
+          fi
+
+          echo "Using APK: $ORIGINAL_APK"
+
+          # 3. Выравнивание 4-byte (zipalign)
+          $ZIPALIGN -f 4 "$ORIGINAL_APK" build/app/outputs/flutter-apk/app-aligned.apk
+
+          # 4. Подпись через apksigner (v1, v2, v3 схемы)
           $APKSIGNER sign --ks release.keystore \
             --ks-key-alias adlocker \
             --ks-pass pass:adlocker123 \
             --key-pass pass:adlocker123 \
-            --out build/app/outputs/flutter-apk/app-release-signed.apk \
-            build/app/outputs/flutter-apk/app-release.apk
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out build/app/outputs/flutter-apk/AdLocker.apk \
+            build/app/outputs/flutter-apk/app-aligned.apk
 
-      - name: Release APK
+          # 5. Проверка целостности подписи
+          $APKSIGNER verify -v build/app/outputs/flutter-apk/AdLocker.apk
+
+      - name: Release Signed APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
-          body: "Релиз AdLocker собран на Gradle 8.4."
-          files: build/app/outputs/flutter-apk/app-release-signed.apk
+          body: "Готовый подписанный релиз AdLocker (RFC 1071 IP Checksum + xbox-dns.ru + local sinkhole)."
+          files: build/app/outputs/flutter-apk/AdLocker.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
