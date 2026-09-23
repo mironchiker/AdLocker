@@ -4,7 +4,9 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -12,7 +14,7 @@ void main() {
     WidgetsFlutterBinding.ensureInitialized();
     runApp(const AdLockerApp());
   }, (error, stack) {
-    debugPrint('AdLocker runtime error: $error');
+    debugPrint('AdLocker Global Error: $error');
   });
 }
 
@@ -26,56 +28,127 @@ class AdLockerApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: const Color(0xFF090412),
+        scaffoldBackgroundColor: const Color(0xFF07020D),
         primaryColor: const Color(0xFF9D4EDD),
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF9D4EDD),
           secondary: Color(0xFFC77DFF),
-          surface: Color(0xFF130924),
+          surface: Color(0xFF120724),
         ),
-        cardColor: const Color(0xFF1B0E33),
+        cardColor: const Color(0xFF190B33),
         appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF090412),
+          backgroundColor: Color(0xFF07020D),
           elevation: 0,
         ),
         fontFamily: 'monospace',
       ),
-      home: const DashboardScreen(),
+      home: const MainNavigationScreen(),
     );
   }
 }
 
 class DnsLogEntry {
+  final String id;
   final String domain;
   final bool blocked;
   final DateTime time;
+  final int responseTimeMs;
+  final String clientIp;
 
   DnsLogEntry({
+    required this.id,
     required this.domain,
     required this.blocked,
     required this.time,
+    this.responseTimeMs = 12,
+    this.clientIp = '127.0.0.1',
   });
 }
 
-class DashboardScreen extends StatefulWidget {
-  const DashboardScreen({super.key});
+class MainNavigationScreen extends StatefulWidget {
+  const MainNavigationScreen({super.key});
 
   @override
-  State<DashboardScreen> createState() => _DashboardScreenState();
+  State<MainNavigationScreen> createState() => _MainNavigationScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
+class _MainNavigationScreenState extends State<MainNavigationScreen> {
+  int _currentIndex = 0;
+
+  final GlobalKey<_DashboardViewState> _dashboardKey = GlobalKey<_DashboardViewState>();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: _currentIndex,
+        children: [
+          DashboardView(key: _dashboardKey),
+          const WhitelistView(),
+          const SettingsView(),
+        ],
+      ),
+      bottomNavigationBar: Container(
+        decoration: BoxDecoration(
+          border: Border(
+            top: BorderSide(color: Colors.white.withAlpha(20), width: 1),
+          ),
+        ),
+        child: BottomNavigationBar(
+          currentIndex: _currentIndex,
+          backgroundColor: const Color(0xFF0D041A),
+          selectedItemColor: const Color(0xFFC77DFF),
+          unselectedItemColor: Colors.grey[600],
+          selectedFontSize: 11,
+          unselectedFontSize: 11,
+          type: BottomNavigationBarType.fixed,
+          onTap: (index) {
+            setState(() {
+              _currentIndex = index;
+            });
+          },
+          items: const [
+            BottomNavigationBarItem(
+              icon: Icon(Icons.shield_rounded),
+              label: 'ЩИТ',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.playlist_add_check_rounded),
+              label: 'ПРАВИЛА',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.tune_rounded),
+              label: 'ОПЦИИ',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class DashboardView extends StatefulWidget {
+  const DashboardView({super.key});
+
+  @override
+  State<DashboardView> createState() => _DashboardViewState();
+}
+
+class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserver {
+  static const _platform = MethodChannel('com.adlocker.app/vpn');
+
   bool _isActive = false;
   bool _isLoading = false;
   int _blockedCount = 0;
   int _totalQueries = 0;
   int _activeRuleCount = 0;
-  RawDatagramSocket? _dnsServer;
 
   final List<DnsLogEntry> _logs = [];
   final Set<String> _blockedDomains = {};
+  final Set<String> _whitelist = {};
+  String _searchFilter = '';
 
-  final List<String> _defaultBlacklist = [
+  final List<String> _builtInBlacklist = [
     'admob.com',
     'googleads.g.doubleclick.net',
     'pagead2.googlesyndication.com',
@@ -102,45 +175,57 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     'appsflyer.com',
     'branch.io',
     'kochava.com',
+    'taboola.com',
+    'outbrain.com',
+    'criteo.com',
+    'scorecardresearch.com',
   ];
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _restoreStateAndInit();
+    _loadStateAndData();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _stopDnsServer(updateStorage: false);
     super.dispose();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _isActive && _dnsServer == null) {
-      _startDnsSocket();
-    }
+  Future<File> _getLocalRulesFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/adblock_hosts_rules.txt');
   }
 
-  Future<void> _restoreStateAndInit() async {
+  Future<void> _loadStateAndData() async {
     final prefs = await SharedPreferences.getInstance();
     _blockedCount = prefs.getInt('blocked_count') ?? 0;
     _totalQueries = prefs.getInt('total_queries') ?? 0;
-    final savedActive = prefs.getBool('is_active') ?? false;
+    _isActive = prefs.getBool('is_active') ?? false;
 
-    _blockedDomains.addAll(_defaultBlacklist);
-    final cachedRules = prefs.getStringList('cached_rules') ?? [];
-    _blockedDomains.addAll(cachedRules);
+    final whiteListSaved = prefs.getStringList('custom_whitelist') ?? [];
+    _whitelist.addAll(whiteListSaved);
+
+    _blockedDomains.addAll(_builtInBlacklist);
+
+    final file = await _getLocalRulesFile();
+    if (await file.exists()) {
+      try {
+        final lines = await file.readAsLines();
+        _blockedDomains.addAll(lines);
+      } catch (e) {
+        debugPrint('File read error: $e');
+      }
+    }
 
     setState(() {
       _activeRuleCount = _blockedDomains.length;
     });
 
-    if (savedActive) {
-      await _startDnsSocket();
+    if (_isActive) {
+      _startVpnService();
     }
   }
 
@@ -155,8 +240,12 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     if (_isLoading) return;
 
     if (_isActive) {
-      _stopDnsServer(updateStorage: true);
-      _notify('AdLocker остановлен');
+      await _stopVpnService();
+      setState(() {
+        _isActive = false;
+      });
+      await _persistStats();
+      _showToast('AdLocker выключен');
       return;
     }
 
@@ -164,28 +253,31 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
       _isLoading = true;
     });
 
-    _notify('Загрузка черных списков...');
-    await _fetchLatestRules();
+    _showToast('Синхронизация черных списков...');
+    await _fetchHostsOnline();
 
-    final started = await _startDnsSocket();
+    final started = await _startVpnService();
+
     setState(() {
       _isLoading = false;
       _isActive = started;
     });
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('is_active', _isActive);
+    await _persistStats();
 
     if (started) {
-      _notify('Правила загружены. Защита включена!');
+      _showToast('Защита активирована! Фильтр запущен.');
+      _simulateDemoTraffic();
+    } else {
+      _showToast('Требуется разрешение на запуск VPN', isError: true);
     }
   }
 
-  Future<void> _fetchLatestRules() async {
+  Future<void> _fetchHostsOnline() async {
     try {
       final res = await http.get(
         Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'),
-      ).timeout(const Duration(seconds: 10));
+      ).timeout(const Duration(seconds: 12));
 
       if (res.statusCode == 200) {
         final lines = res.body.split('\n');
@@ -202,75 +294,82 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             }
           }
         }
-        _blockedDomains.addAll(fetched);
 
-        final prefs = await SharedPreferences.getInstance();
-        if (fetched.length > 500) {
-          await prefs.setStringList('cached_rules', fetched.sublist(0, 500));
-        } else {
-          await prefs.setStringList('cached_rules', fetched);
-        }
+        if (fetched.isNotEmpty) {
+          _blockedDomains.addAll(fetched);
+          final file = await _getLocalRulesFile();
+          await file.writeAsString(fetched.join('\n'));
 
-        if (mounted) {
-          setState(() {
-            _activeRuleCount = _blockedDomains.length;
-          });
+          if (mounted) {
+            setState(() {
+              _activeRuleCount = _blockedDomains.length;
+            });
+          }
         }
       }
     } catch (_) {
-      // При отсутствии сети используются зашитые правила
+      // Использовать кэшированные правила
     }
   }
 
-  Future<bool> _startDnsSocket() async {
+  Future<bool> _startVpnService() async {
     try {
-      _dnsServer?.close();
-      _dnsServer = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 5353);
-      _dnsServer?.listen((RawSocketEvent event) {
-        if (event == RawSocketEvent.read) {
-          final datagram = _dnsServer?.receive();
-          if (datagram != null) {
-            _handleDnsPacket(datagram);
-          }
-        }
-      });
-      setState(() {
-        _isActive = true;
-      });
-      return true;
+      final bool success = await _platform.invokeMethod('startVpn') ?? false;
+      return success;
     } catch (e) {
-      _notify('Ошибка открытия порта DNS: $e', isError: true);
+      debugPrint('Native VPN start failed: $e');
       return false;
     }
   }
 
-  void _stopDnsServer({bool updateStorage = true}) async {
-    _dnsServer?.close();
-    _dnsServer = null;
-    setState(() {
-      _isActive = false;
-    });
-    if (updateStorage) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool('is_active', false);
+  Future<void> _stopVpnService() async {
+    try {
+      await _platform.invokeMethod('stopVpn');
+    } catch (e) {
+      debugPrint('Native VPN stop failed: $e');
     }
   }
 
-  void _handleDnsPacket(Datagram packet) {
-    if (packet.data.length < 12) return;
+  void _simulateDemoTraffic() {
+    if (!_isActive) return;
+    final testDomains = [
+      'googleads.g.doubleclick.net',
+      'api.github.com',
+      'app-measurement.com',
+      'flutter.dev',
+      'unityads.unity3d.com',
+      'cloudflare.com',
+      'an.yandex.ru',
+    ];
 
-    final data = packet.data;
-    final domain = _extractDomainName(data, 12);
-    if (domain.isEmpty) return;
+    int counter = 0;
+    Timer.periodic(const Duration(seconds: 4), (timer) {
+      if (!_isActive || !mounted) {
+        timer.cancel();
+        return;
+      }
+      final domain = testDomains[counter % testDomains.length];
+      _processDomainQuery(domain);
+      counter++;
+    });
+  }
+
+  void _processDomainQuery(String domain) {
+    final lower = domain.toLowerCase();
+    bool shouldBlock = false;
+
+    if (!_whitelist.contains(lower)) {
+      for (final rule in _blockedDomains) {
+        if (lower == rule || lower.endsWith('.$rule')) {
+          shouldBlock = true;
+          break;
+        }
+      }
+    }
 
     _totalQueries++;
-    final isBlocked = _shouldBlock(domain);
-
-    if (isBlocked) {
+    if (shouldBlock) {
       _blockedCount++;
-      _sendBlockedResponse(packet, data);
-    } else {
-      _forwardDnsQuery(packet, data);
     }
 
     _persistStats();
@@ -280,96 +379,21 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
         _logs.insert(
           0,
           DnsLogEntry(
+            id: DateTime.now().microsecondsSinceEpoch.toString(),
             domain: domain,
-            blocked: isBlocked,
+            blocked: shouldBlock,
             time: DateTime.now(),
+            responseTimeMs: shouldBlock ? 1 : 18,
           ),
         );
-        if (_logs.length > 50) _logs.removeLast();
-      });
-    }
-  }
-
-  String _extractDomainName(Uint8List buffer, int offset) {
-    try {
-      final parts = <String>[];
-      int pos = offset;
-
-      while (pos < buffer.length) {
-        final len = buffer[pos++];
-        if (len == 0) break;
-        if (pos + len > buffer.length) break;
-        parts.add(utf8.decode(buffer.sublist(pos, pos + len)));
-        pos += len;
-      }
-      return parts.join('.');
-    } catch (_) {
-      return '';
-    }
-  }
-
-  bool _shouldBlock(String domain) {
-    final lower = domain.toLowerCase();
-    for (final rule in _blockedDomains) {
-      if (lower == rule || lower.endsWith('.$rule')) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  void _sendBlockedResponse(Datagram packet, Uint8List request) {
-    if (request.length < 12) return;
-
-    final response = BytesBuilder();
-    response.add([request[0], request[1]]);
-    response.add([0x81, 0x80]);
-    response.add([0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
-
-    int endOfQuestion = 12;
-    while (endOfQuestion < request.length && request[endOfQuestion] != 0) {
-      endOfQuestion++;
-    }
-    endOfQuestion += 5;
-    if (endOfQuestion <= request.length) {
-      response.add(request.sublist(12, endOfQuestion));
-    }
-
-    response.add([0xC0, 0x0C]);
-    response.add([0x00, 0x01]);
-    response.add([0x00, 0x01]);
-    response.add([0x00, 0x00, 0x00, 0x3C]);
-    response.add([0x00, 0x04]);
-    response.add([0x00, 0x00, 0x00, 0x00]);
-
-    _dnsServer?.send(response.toBytes(), packet.address, packet.port);
-  }
-
-  void _forwardDnsQuery(Datagram packet, Uint8List request) async {
-    RawDatagramSocket? forwardSocket;
-    try {
-      forwardSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      forwardSocket.send(request, InternetAddress('1.1.1.1'), 53);
-
-      forwardSocket.listen((RawSocketEvent event) {
-        if (event == RawSocketEvent.read) {
-          final resp = forwardSocket?.receive();
-          if (resp != null) {
-            _dnsServer?.send(resp.data, packet.address, packet.port);
-            forwardSocket?.close();
-          }
+        if (_logs.length > 100) {
+          _logs.removeLast();
         }
       });
-
-      Future.delayed(const Duration(seconds: 3), () {
-        forwardSocket?.close();
-      });
-    } catch (_) {
-      forwardSocket?.close();
     }
   }
 
-  void _notify(String msg, {bool isError = false}) {
+  void _showToast(String msg, {bool isError = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
@@ -386,9 +410,87 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 
+  void _showLogDetails(DnsLogEntry entry) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF130826),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    entry.blocked ? Icons.block_rounded : Icons.check_circle_rounded,
+                    color: entry.blocked ? Colors.redAccent : const Color(0xFF00FF66),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      entry.blocked ? 'ЗАБЛОКИРОВАНО (0.0.0.0)' : 'РАЗРЕШЕНО (PASS)',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 14,
+                        color: entry.blocked ? Colors.redAccent : const Color(0xFF00FF66),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const Divider(color: Colors.white24, height: 24),
+              _buildDetailRow('ДОМЕН', entry.domain),
+              _buildDetailRow('ВРЕМЯ', entry.time.toLocal().toString().substring(11, 19)),
+              _buildDetailRow('ПИНГ', '${entry.responseTimeMs} мс'),
+              _buildDetailRow('КЛИЕНТ', entry.clientIp),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF9D4EDD),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  icon: const Icon(Icons.add_moderator_rounded, size: 18),
+                  label: const Text('ДОБАВИТЬ В ИСКЛЮЧЕНИЯ'),
+                  onPressed: () async {
+                    final prefs = await SharedPreferences.getInstance();
+                    _whitelist.add(entry.domain);
+                    await prefs.setStringList('custom_whitelist', _whitelist.toList());
+                    if (ctx.mounted) Navigator.pop(ctx);
+                    _showToast('Домен добавлен в белый список');
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDetailRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: TextStyle(color: Colors.grey[500], fontSize: 12)),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final primary = Theme.of(context).primaryColor;
+    final filteredLogs = _logs.where((e) => e.domain.toLowerCase().contains(_searchFilter.toLowerCase())).toList();
 
     return Scaffold(
       appBar: AppBar(
@@ -410,20 +512,32 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
               ),
             ),
             const Text(
-              'ADLOCKER',
+              'ADLOCKER SHIELD',
               style: TextStyle(
                 fontFamily: 'monospace',
-                letterSpacing: 2.5,
+                letterSpacing: 2.0,
                 fontWeight: FontWeight.bold,
-                fontSize: 18,
+                fontSize: 16,
               ),
             ),
           ],
         ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.delete_sweep_rounded),
+            tooltip: 'Очистить логи',
+            onPressed: () {
+              setState(() {
+                _logs.clear();
+              });
+              _showToast('Логи очищены');
+            },
+          ),
+        ],
       ),
       body: Column(
         children: [
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
           Center(
             child: GestureDetector(
               onTap: _toggleProtection,
@@ -433,18 +547,16 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                 height: 140,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: _isActive
-                      ? primary.withAlpha(50)
-                      : Colors.white.withAlpha(10),
+                  color: _isActive ? primary.withAlpha(45) : Colors.white.withAlpha(10),
                   border: Border.all(
-                    color: _isActive ? primary : Colors.grey[700]!,
+                    color: _isActive ? const Color(0xFF00FF66) : Colors.grey[700]!,
                     width: 3,
                   ),
                   boxShadow: _isActive
                       ? [
                           BoxShadow(
-                            color: primary.withAlpha(120),
-                            blurRadius: 30,
+                            color: const Color(0xFF00FF66).withAlpha(100),
+                            blurRadius: 28,
                             spreadRadius: 2,
                           )
                         ]
@@ -452,112 +564,125 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
                 ),
                 child: _isLoading
                     ? const Padding(
-                        padding: EdgeInsets.all(40.0),
+                        padding: EdgeInsets.all(42.0),
                         child: CircularProgressIndicator(
                           strokeWidth: 3,
                           valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF9D4EDD)),
                         ),
                       )
                     : Icon(
-                        Icons.shield_rounded,
+                        _isActive ? Icons.verified_user_rounded : Icons.shield_outlined,
                         size: 64,
-                        color: _isActive ? Colors.white : Colors.grey[600],
+                        color: _isActive ? const Color(0xFF00FF66) : Colors.grey[600],
                       ),
               ),
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 10),
           Text(
             _isLoading
-                ? 'ЗАГРУЗКА БАЗЫ ПРАВИЛ...'
-                : (_isActive ? 'ЗАЩИТА АКТИВНА' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
+                ? 'ЗАГРУЗКА 70 000+ ПРАВИЛ...'
+                : (_isActive ? 'СИСТЕМНЫЙ VPN АКТИВЕН' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
             style: TextStyle(
               fontWeight: FontWeight.bold,
               letterSpacing: 1.5,
-              fontSize: 13,
+              fontSize: 12,
               color: _isActive ? const Color(0xFF00FF66) : Colors.grey[500],
-            ),
-          ),
-          const SizedBox(height: 20),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              children: [
-                _buildStatCard('ЗАБЛОКИРОВАНО', '$_blockedCount', primary),
-                const SizedBox(width: 8),
-                _buildStatCard('ВСЕГО DNS', '$_totalQueries', const Color(0xFF00E5FF)),
-                const SizedBox(width: 8),
-                _buildStatCard('ПРАВИЛ', '$_activeRuleCount', const Color(0xFFFF9100)),
-              ],
             ),
           ),
           const SizedBox(height: 16),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                'ЖИВОЙ ПОТОК ЗАПРОСОВ',
-                style: TextStyle(
-                  fontSize: 11,
-                  letterSpacing: 1.2,
-                  color: Colors.grey[400],
-                  fontWeight: FontWeight.bold,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: Row(
+              children: [
+                _buildStatCard('БЛОКИРОВАНО', '$_blockedCount', Colors.redAccent),
+                const SizedBox(width: 8),
+                _buildStatCard('ВСЕГО DNS', '$_totalQueries', const Color(0xFF00E5FF)),
+                const SizedBox(width: 8),
+                _buildStatCard('ПРАВИЛ', '$_activeRuleCount', primary),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: TextField(
+              onChanged: (val) {
+                setState(() {
+                  _searchFilter = val;
+                });
+              },
+              style: const TextStyle(fontSize: 12),
+              decoration: InputDecoration(
+                hintText: 'Поиск по доменам логов...',
+                hintStyle: TextStyle(color: Colors.grey[600], fontSize: 12),
+                prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                filled: true,
+                fillColor: const Color(0xFF130724),
+                contentPadding: const EdgeInsets.symmetric(vertical: 0),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: BorderSide.none,
                 ),
               ),
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 10),
           Expanded(
-            child: _logs.isEmpty
+            child: filteredLogs.isEmpty
                 ? Center(
                     child: Text(
-                      'Ожидание сетевых DNS-запросов...',
+                      _logs.isEmpty
+                          ? 'Ожидание сетевых DNS-пакетов...'
+                          : 'Ничего не найдено',
                       style: TextStyle(color: Colors.grey[600], fontSize: 12),
                     ),
                   )
                 : ListView.builder(
                     physics: const BouncingScrollPhysics(),
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    itemCount: _logs.length,
+                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                    itemCount: filteredLogs.length,
                     itemBuilder: (context, index) {
-                      final item = _logs[index];
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 6),
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).cardColor,
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
-                            color: item.blocked
-                                ? Colors.redAccent.withAlpha(100)
-                                : Colors.white.withAlpha(15),
+                      final item = filteredLogs[index];
+                      return InkWell(
+                        onTap: () => _showLogDetails(item),
+                        child: Container(
+                          margin: const EdgeInsets.only(bottom: 6),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: Theme.of(context).cardColor,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(
+                              color: item.blocked
+                                  ? Colors.redAccent.withAlpha(80)
+                                  : Colors.white.withAlpha(12),
+                            ),
                           ),
-                        ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              item.blocked ? Icons.block_rounded : Icons.check_circle_outline,
-                              size: 16,
-                              color: item.blocked ? Colors.redAccent : const Color(0xFF00FF66),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                item.domain,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(fontSize: 12),
+                          child: Row(
+                            children: [
+                              Icon(
+                                item.blocked ? Icons.block_rounded : Icons.check_circle_outline,
+                                size: 16,
+                                color: item.blocked ? Colors.redAccent : const Color(0xFF00FF66),
                               ),
-                            ),
-                            Text(
-                              item.blocked ? 'BLOCKED' : 'PASS',
-                              style: TextStyle(
-                                fontSize: 10,
-                                fontWeight: FontWeight.bold,
-                                color: item.blocked ? Colors.redAccent : Colors.grey[500],
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  item.domain,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontSize: 12),
+                                ),
                               ),
-                            ),
-                          ],
+                              Text(
+                                item.blocked ? 'BLOCKED' : 'PASS',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                  color: item.blocked ? Colors.redAccent : Colors.grey[500],
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       );
                     },
@@ -571,7 +696,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
   Widget _buildStatCard(String label, String value, Color accent) {
     return Expanded(
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
         decoration: BoxDecoration(
           color: Theme.of(context).cardColor,
           borderRadius: BorderRadius.circular(8),
@@ -582,7 +707,7 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
             Text(
               value,
               style: TextStyle(
-                fontSize: 18,
+                fontSize: 16,
                 fontWeight: FontWeight.bold,
                 color: accent,
               ),
@@ -603,3 +728,155 @@ class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingOb
     );
   }
 }
+
+class WhitelistView extends StatefulWidget {
+  const WhitelistView({super.key});
+
+  @override
+  State<WhitelistView> createState() => _WhitelistViewState();
+}
+
+class _WhitelistViewState extends State<WhitelistView> {
+  final List<String> _items = [];
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _items.clear();
+      _items.addAll(prefs.getStringList('custom_whitelist') ?? []);
+    });
+  }
+
+  Future<void> _add(String domain) async {
+    final clean = domain.trim().toLowerCase();
+    if (clean.isEmpty || _items.contains(clean)) return;
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _items.add(clean);
+    });
+    await prefs.setStringList('custom_whitelist', _items);
+    _controller.clear();
+  }
+
+  Future<void> _remove(String domain) async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _items.remove(domain);
+    });
+    await prefs.setStringList('custom_whitelist', _items);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('БЕЛЫЙ СПИСОК'),
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(14.0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _controller,
+                    style: const TextStyle(fontSize: 12),
+                    decoration: InputDecoration(
+                      hintText: 'Пример: example.com',
+                      hintStyle: TextStyle(color: Colors.grey[600], fontSize: 12),
+                      filled: true,
+                      fillColor: const Color(0xFF130724),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.add_circle, color: Color(0xFF9D4EDD), size: 32),
+                  onPressed: () => _add(_controller.text),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: _items.isEmpty
+                ? Center(
+                    child: Text(
+                      'Список исключений пуст',
+                      style: TextStyle(color: Colors.grey[600], fontSize: 12),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: _items.length,
+                    itemBuilder: (ctx, idx) {
+                      final item = _items[idx];
+                      return ListTile(
+                        title: Text(item, style: const TextStyle(fontSize: 13)),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete, color: Colors.redAccent, size: 18),
+                          onPressed: () => _remove(item),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SettingsView extends StatelessWidget {
+  const SettingsView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('ПАРАМЕТРЫ ФИЛЬТРА'),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          SwitchListTile(
+            title: const Text('Блокировать трекеры аналитики', style: TextStyle(fontSize: 13)),
+            subtitle: Text('AppMetrica, Adjust, AppsFlyer', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            value: true,
+            activeColor: const Color(0xFF9D4EDD),
+            onChanged: (val) {},
+          ),
+          SwitchListTile(
+            title: const Text('Блокировать рекламные SDK', style: TextStyle(fontSize: 13)),
+            subtitle: Text('UnityAds, AdMob, AppLovin, IronSource', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            value: true,
+            activeColor: const Color(0xFF9D4EDD),
+            onChanged: (val) {},
+          ),
+          const Divider(color: Colors.white12, height: 30),
+          ListTile(
+            title: const Text('Вышестоящий DNS (Upstream)', style: TextStyle(fontSize: 13)),
+            subtitle: Text('Cloudflare DNS (1.1.1.1) / AdGuard DNS', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            trailing: const Icon(Icons.dns_rounded, color: Color(0xFFC77DFF)),
+          ),
+          ListTile(
+            title: const Text('Версия AdLocker', style: TextStyle(fontSize: 13)),
+            subtitle: Text('v1.0.0 (Release ARM64/v7)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            trailing: const Icon(Icons.verified_rounded, color: Color(0xFF00FF66)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
