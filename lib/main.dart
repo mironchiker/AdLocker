@@ -64,50 +64,40 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
   bool _isActive = false;
+  bool _isLoading = false;
   int _blockedCount = 0;
   int _totalQueries = 0;
   int _activeRuleCount = 0;
   RawDatagramSocket? _dnsServer;
-  
+
   final List<DnsLogEntry> _logs = [];
   final Set<String> _blockedDomains = {};
 
   final List<String> _defaultBlacklist = [
-    // Google AdMob & DoubleClick
     'admob.com',
     'googleads.g.doubleclick.net',
     'pagead2.googlesyndication.com',
     'ads.google.com',
     'adservice.google.com',
     'app-measurement.com',
-    
-    // Unity Ads
     'unityads.unity3d.com',
     'auction.unityads.unity3d.com',
     'webview.unityads.unity3d.com',
     'config.unityads.unity3d.com',
-    
-    // AppLovin & IronSource
     'applovin.com',
     'applvn.com',
     'ironsrc.mobi',
     'supersonicads.com',
     'is.com',
-    
-    // Vungle & Mintegral
     'vungle.com',
     'api.vungle.com',
     'mintegral.net',
     'pgl.mintegral.com',
-    
-    // Яндекс Директ & Метрика
     'an.yandex.ru',
     'appmetrica.yandex.net',
     'adfox.yandex.ru',
-    
-    // Мобильная телеметрия & трекеры
     'adjust.com',
     'appsflyer.com',
     'branch.io',
@@ -117,33 +107,124 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
-    _loadState();
+    WidgetsBinding.instance.addObserver(this);
+    _restoreStateAndInit();
   }
 
   @override
   void dispose() {
-    _stopDnsServer();
+    WidgetsBinding.instance.removeObserver(this);
+    _stopDnsServer(updateStorage: false);
     super.dispose();
   }
 
-  void _loadState() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _blockedCount = prefs.getInt('blocked_count') ?? 0;
-      _totalQueries = prefs.getInt('total_queries') ?? 0;
-      _blockedDomains.addAll(_defaultBlacklist);
-      _activeRuleCount = _blockedDomains.length;
-    });
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _isActive && _dnsServer == null) {
+      _startDnsSocket();
+    }
   }
 
-  void _persistStats() async {
+  Future<void> _restoreStateAndInit() async {
+    final prefs = await SharedPreferences.getInstance();
+    _blockedCount = prefs.getInt('blocked_count') ?? 0;
+    _totalQueries = prefs.getInt('total_queries') ?? 0;
+    final savedActive = prefs.getBool('is_active') ?? false;
+
+    _blockedDomains.addAll(_defaultBlacklist);
+    final cachedRules = prefs.getStringList('cached_rules') ?? [];
+    _blockedDomains.addAll(cachedRules);
+
+    setState(() {
+      _activeRuleCount = _blockedDomains.length;
+    });
+
+    if (savedActive) {
+      await _startDnsSocket();
+    }
+  }
+
+  Future<void> _persistStats() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('blocked_count', _blockedCount);
     await prefs.setInt('total_queries', _totalQueries);
+    await prefs.setBool('is_active', _isActive);
   }
 
-  Future<void> _startDnsServer() async {
+  Future<void> _toggleProtection() async {
+    if (_isLoading) return;
+
+    if (_isActive) {
+      _stopDnsServer(updateStorage: true);
+      _notify('AdLocker остановлен');
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    _notify('Загрузка черных списков...');
+    await _fetchLatestRules();
+
+    final started = await _startDnsSocket();
+    setState(() {
+      _isLoading = false;
+      _isActive = started;
+    });
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('is_active', _isActive);
+
+    if (started) {
+      _notify('Правила загружены. Защита включена!');
+    }
+  }
+
+  Future<void> _fetchLatestRules() async {
     try {
+      final res = await http.get(
+        Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'),
+      ).timeout(const Duration(seconds: 10));
+
+      if (res.statusCode == 200) {
+        final lines = res.body.split('\n');
+        final fetched = <String>[];
+        for (var line in lines) {
+          line = line.trim();
+          if (line.startsWith('0.0.0.0 ')) {
+            final parts = line.split(RegExp(r'\s+'));
+            if (parts.length >= 2) {
+              final host = parts[1].trim();
+              if (host != '0.0.0.0' && host.isNotEmpty) {
+                fetched.add(host);
+              }
+            }
+          }
+        }
+        _blockedDomains.addAll(fetched);
+
+        final prefs = await SharedPreferences.getInstance();
+        if (fetched.length > 500) {
+          await prefs.setStringList('cached_rules', fetched.sublist(0, 500));
+        } else {
+          await prefs.setStringList('cached_rules', fetched);
+        }
+
+        if (mounted) {
+          setState(() {
+            _activeRuleCount = _blockedDomains.length;
+          });
+        }
+      }
+    } catch (_) {
+      // При отсутствии сети используются зашитые правила
+    }
+  }
+
+  Future<bool> _startDnsSocket() async {
+    try {
+      _dnsServer?.close();
       _dnsServer = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 5353);
       _dnsServer?.listen((RawSocketEvent event) {
         if (event == RawSocketEvent.read) {
@@ -153,30 +234,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
           }
         }
       });
-
       setState(() {
         _isActive = true;
       });
-      _notify('AdLocker активирован');
+      return true;
     } catch (e) {
-      _notify('Ошибка запуска локального DNS: $e', isError: true);
+      _notify('Ошибка открытия порта DNS: $e', isError: true);
+      return false;
     }
   }
 
-  void _stopDnsServer() {
+  void _stopDnsServer({bool updateStorage = true}) async {
     _dnsServer?.close();
     _dnsServer = null;
     setState(() {
       _isActive = false;
     });
-    _notify('AdLocker деактивирован');
-  }
-
-  void _toggleProtection() {
-    if (_isActive) {
-      _stopDnsServer();
-    } else {
-      _startDnsServer();
+    if (updateStorage) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('is_active', false);
     }
   }
 
@@ -293,39 +369,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  Future<void> _updateRulesFromWeb() async {
-    _notify('Загрузка свежих правил...');
-    try {
-      final res = await http.get(
-        Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'),
-      ).timeout(const Duration(seconds: 8));
-
-      if (res.statusCode == 200) {
-        int added = 0;
-        final lines = res.body.split('\n');
-        for (var line in lines) {
-          line = line.trim();
-          if (line.startsWith('0.0.0.0 ')) {
-            final parts = line.split(RegExp(r'\s+'));
-            if (parts.length >= 2) {
-              final host = parts[1].trim();
-              if (host != '0.0.0.0' && host.isNotEmpty) {
-                _blockedDomains.add(host);
-                added++;
-              }
-            }
-          }
-        }
-        setState(() {
-          _activeRuleCount = _blockedDomains.length;
-        });
-        _notify('Обновлено! Добавлено: $added');
-      }
-    } catch (e) {
-      _notify('Ошибка обновления правил: $e', isError: true);
-    }
-  }
-
   void _notify(String msg, {bool isError = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -377,13 +420,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           ],
         ),
-        actions: [
-          IconButton(
-            tooltip: 'Обновить правила',
-            icon: const Icon(Icons.sync_rounded),
-            onPressed: _updateRulesFromWeb,
-          ),
-        ],
       ),
       body: Column(
         children: [
@@ -414,17 +450,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         ]
                       : [],
                 ),
-                child: Icon(
-                  Icons.shield_rounded,
-                  size: 64,
-                  color: _isActive ? Colors.white : Colors.grey[600],
-                ),
+                child: _isLoading
+                    ? const Padding(
+                        padding: EdgeInsets.all(40.0),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 3,
+                          valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF9D4EDD)),
+                        ),
+                      )
+                    : Icon(
+                        Icons.shield_rounded,
+                        size: 64,
+                        color: _isActive ? Colors.white : Colors.grey[600],
+                      ),
               ),
             ),
           ),
           const SizedBox(height: 12),
           Text(
-            _isActive ? 'ЗАЩИТА АКТИВНА' : 'ЗАЩИТА ВЫКЛЮЧЕНА',
+            _isLoading
+                ? 'ЗАГРУЗКА БАЗЫ ПРАВИЛ...'
+                : (_isActive ? 'ЗАЩИТА АКТИВНА' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
             style: TextStyle(
               fontWeight: FontWeight.bold,
               letterSpacing: 1.5,
@@ -557,4 +603,3 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 }
-
