@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -268,8 +267,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     if (started) {
       _showToast('Защита активирована! Фильтр запущен.');
       _simulateDemoTraffic();
-    } else {
-      _showToast('Требуется разрешение на запуск VPN', isError: true);
     }
   }
 
@@ -314,9 +311,13 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
   Future<bool> _startVpnService() async {
     try {
-      final bool success = await _platform.invokeMethod('startVpn') ?? false;
-      return success;
+      final bool? success = await _platform.invokeMethod<bool>('startVpn');
+      if (success != true) {
+        _showToast('В разрешении VPN отказано', isError: true);
+      }
+      return success ?? false;
     } catch (e) {
+      _showToast('Ошибка вызова VPN: $e', isError: true);
       debugPrint('Native VPN start failed: $e');
       return false;
     }
@@ -403,7 +404,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
         ),
         backgroundColor: isError ? Colors.redAccent[700] : const Color(0xFF9D4EDD),
-        duration: const Duration(seconds: 2),
+        duration: const Duration(seconds: 3),
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
@@ -879,4 +880,3 @@ class SettingsView extends StatelessWidget {
     );
   }
 }
-
