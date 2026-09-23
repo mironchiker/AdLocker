@@ -27,33 +27,20 @@ jobs:
           flutter-version: '3.22.x'
           channel: 'stable'
 
-      - name: Fix Android v2 Embedding and Manifest
+      - name: Validate AndroidManifest XML
         run: |
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          
-          # Убираем старый класс FlutterApplication v1 embedding
-          sed -i 's/android:name="io.flutter.app.FlutterApplication"//g' "$MANIFEST" || true
-          
-          # Убираем устаревший meta-data flutterEmbedding, если он был со значением 1
-          sed -i '/android:name="flutterEmbedding"/d' "$MANIFEST" || true
-          
-          # Добавляем современный v2 embedding
-          sed -i '/<application/a \        <meta-data android:name="flutterEmbedding" android:value="2"/>' "$MANIFEST" || true
+          sudo apt-get update && sudo apt-get install -y libxml2-utils
+          xmllint --noout android/app/src/main/AndroidManifest.xml
 
-          # Добавляем разрешения
-          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' "$MANIFEST" || true
-          
-          # Регистрируем VpnService
-          sed -i '/AdLockerVpnService/d' "$MANIFEST" || true
-          sed -i '/<\/application>/i \        <service android:name=".AdLockerVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false">\n            <intent-filter>\n                <action android:name="android.net.VpnService"/>\n            </intent-filter>\n        </service>' "$MANIFEST" || true
-
-      - name: Get dependencies
-        run: flutter pub get
+      - name: Clean build cache and fetch dependencies
+        run: |
+          flutter clean
+          flutter pub get
 
       - name: Build Release APK
         run: flutter build apk --release --target-platform=android-arm,android-arm64 --no-shrink
 
-      - name: Sign APK
+      - name: Sign APK (V1 + V2 + V3)
         run: |
           keytool -genkeypair -v -keystore release.keystore -alias adlocker \
             -keyalg RSA -keysize 2048 -validity 10000 \
@@ -73,7 +60,7 @@ jobs:
         with:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
-          body: "Исправлена ошибка Android v1 embedding. Полная поддержка v2 embedding."
+          body: "Релиз AdLocker с проверенным AndroidManifest.xml."
           files: build/app/outputs/flutter-apk/app-release-signed.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
