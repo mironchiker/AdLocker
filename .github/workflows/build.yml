@@ -33,23 +33,16 @@ jobs:
             flutter create . --platforms=android --project-name=adlocker --org=com.adlocker.app
           fi
 
-      - name: Configure Android permissions & SDK
+      - name: Configure Android permissions
         run: |
-          # Сетевые разрешения
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>' android/app/src/main/AndroidManifest.xml || true
-          
-          # Версии SDK и архитектуры процессоров (для веса ~20-25 МБ)
-          sed -i 's/minSdkVersion [0-9]*/minSdkVersion 23/' android/app/build.gradle || true
-          sed -i 's/minSdk = [0-9]*/minSdk = 23/' android/app/build.gradle || true
-          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/' android/app/build.gradle || true
-          sed -i 's/targetSdk = [0-9]*/targetSdk = 34/' android/app/build.gradle || true
-          sed -i '/defaultConfig {/a \        ndk { abiFilters "arm64-v8a", "armeabi-v7a" }' android/app/build.gradle || true
 
       - name: Get dependencies
         run: flutter pub get
 
       - name: Build Single Release APK
-        run: flutter build apk --release --no-shrink
+        run: |
+          flutter build apk --release --target-platform=android-arm,android-arm64 --no-shrink
 
       - name: Prepare APK for Release
         run: |
@@ -70,4 +63,3 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
