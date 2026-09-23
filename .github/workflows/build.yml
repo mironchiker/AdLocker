@@ -44,10 +44,29 @@ jobs:
         run: |
           flutter build apk --release --target-platform=android-arm,android-arm64 --no-shrink
 
+      - name: Sign APK (V1 + V2 + V3)
+        run: |
+          # Создаем хранилище ключей
+          keytool -genkeypair -v -keystore release.keystore -alias adlocker \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass adlocker123 -keypass adlocker123 \
+            -dname "CN=AdLocker, OU=App, O=AdLocker, L=City, S=State, C=RU"
+
+          # Ищем apksigner в установленном Android SDK
+          APKSIGNER=$(find $ANDROID_SDK_ROOT/build-tools -name apksigner | sort -V | tail -n 1)
+          
+          # Подписываем APK сразу всеми схемами
+          $APKSIGNER sign --ks release.keystore \
+            --ks-key-alias adlocker \
+            --ks-pass pass:adlocker123 \
+            --key-pass pass:adlocker123 \
+            --out build/app/outputs/flutter-apk/app-release-signed.apk \
+            build/app/outputs/flutter-apk/app-release.apk
+
       - name: Prepare APK for Release
         run: |
           mkdir -p release_apks
-          cp build/app/outputs/flutter-apk/app-release.apk release_apks/AdLocker.apk
+          cp build/app/outputs/flutter-apk/app-release-signed.apk release_apks/AdLocker.apk
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -56,8 +75,8 @@ jobs:
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
           body: |
             ## AdLocker — Shield & Ad Blocker
-            * Релизная сборка APK под Android (ARM64 / ARMv7).
-            * Локальный DNS-перехват и фильтрация рекламы.
+            * Релизный APK с полной подписью Android V1/V2/V3.
+            * Архитектуры: ARM64 и ARMv7.
           files: release_apks/AdLocker.apk
           draft: false
           prerelease: false
