@@ -233,7 +233,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка базы правил StevenBlack...');
+      _showToast('Загрузка базы StevenBlack...');
       await _downloadRules(file);
     }
 
@@ -244,13 +244,13 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         _isActive = started ?? false;
       });
       if (_isActive) {
-        _showToast('Защита активна. Синхоул 0.0.0.0 включен');
+        _showToast('Синхоул 0.0.0.0 активен');
       }
     } catch (e) {
       setState(() {
         _isLoading = false;
       });
-      _showToast('Ошибка VPN: $e', isError: true);
+      _showToast('Ошибка запуска: $e', isError: true);
     }
   }
 
