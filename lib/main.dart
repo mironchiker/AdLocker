@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -46,21 +45,15 @@ class AdLockerApp extends StatelessWidget {
   }
 }
 
-class DnsLogEntry {
-  final String id;
+class DnsPacketItem {
   final String domain;
   final bool blocked;
   final DateTime time;
-  final int responseTimeMs;
-  final String clientIp;
 
-  DnsLogEntry({
-    required this.id,
+  DnsPacketItem({
     required this.domain,
     required this.blocked,
     required this.time,
-    this.responseTimeMs = 12,
-    this.clientIp = '127.0.0.1',
   });
 }
 
@@ -74,17 +67,15 @@ class MainNavigationScreen extends StatefulWidget {
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _currentIndex = 0;
 
-  final GlobalKey<_DashboardViewState> _dashboardKey = GlobalKey<_DashboardViewState>();
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: IndexedStack(
         index: _currentIndex,
-        children: [
-          DashboardView(key: _dashboardKey),
-          const WhitelistView(),
-          const SettingsView(),
+        children: const [
+          DashboardView(),
+          WhitelistView(),
+          SettingsView(),
         ],
       ),
       bottomNavigationBar: Container(
@@ -138,101 +129,91 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
   bool _isActive = false;
   bool _isLoading = false;
-  int _blockedCount = 0;
-  int _totalQueries = 0;
   int _activeRuleCount = 0;
+  int _blockedQueries = 0;
+  int _totalQueries = 0;
 
-  final List<DnsLogEntry> _logs = [];
-  final Set<String> _blockedDomains = {};
-  final Set<String> _whitelist = {};
-  String _searchFilter = '';
-
-  final List<String> _builtInBlacklist = [
-    'admob.com',
-    'googleads.g.doubleclick.net',
-    'pagead2.googlesyndication.com',
-    'ads.google.com',
-    'adservice.google.com',
-    'app-measurement.com',
-    'unityads.unity3d.com',
-    'auction.unityads.unity3d.com',
-    'webview.unityads.unity3d.com',
-    'config.unityads.unity3d.com',
-    'applovin.com',
-    'applvn.com',
-    'ironsrc.mobi',
-    'supersonicads.com',
-    'is.com',
-    'vungle.com',
-    'api.vungle.com',
-    'mintegral.net',
-    'pgl.mintegral.com',
-    'an.yandex.ru',
-    'appmetrica.yandex.net',
-    'adfox.yandex.ru',
-    'adjust.com',
-    'appsflyer.com',
-    'branch.io',
-    'kochava.com',
-    'taboola.com',
-    'outbrain.com',
-    'criteo.com',
-    'scorecardresearch.com',
-  ];
+  String _searchQuery = '';
+  final List<DnsPacketItem> _realLogs = [];
+  Timer? _statsTimer;
+  final Set<String> _rules = {};
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _loadStateAndData();
+    _loadState();
+    _startStatsPolling();
   }
 
   @override
   void dispose() {
+    _statsTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
-  Future<File> _getLocalRulesFile() async {
+  void _startStatsPolling() {
+    _statsTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (!_isActive) return;
+      try {
+        final res = await _platform.invokeMethod<Map<dynamic, dynamic>>('getStats');
+        if (res != null && mounted) {
+          final isRunning = (res['isRunning'] as bool?) ?? false;
+          final blocked = (res['blockedCount'] as int?) ?? _blockedQueries;
+          final total = (res['totalQueries'] as int?) ?? _totalQueries;
+          final rawQueries = res['recentQueries'] as List<dynamic>?;
+
+          setState(() {
+            _isActive = isRunning;
+            _blockedQueries = blocked;
+            _totalQueries = total;
+
+            if (rawQueries != null && rawQueries.isNotEmpty) {
+              _realLogs.clear();
+              for (final q in rawQueries) {
+                if (q is Map) {
+                  final domain = q['domain']?.toString() ?? '';
+                  final isBlk = q['blocked'] == true;
+                  final timeMs = (q['time'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
+                  if (domain.isNotEmpty) {
+                    _realLogs.add(DnsPacketItem(
+                      domain: domain,
+                      blocked: isBlk,
+                      time: DateTime.fromMillisecondsSinceEpoch(timeMs),
+                    ));
+                  }
+                }
+              }
+            }
+          });
+        }
+      } catch (_) {}
+    });
+  }
+
+  Future<File> _getRulesFile() async {
     final dir = await getApplicationDocumentsDirectory();
     return File('${dir.path}/adblock_hosts_rules.txt');
   }
 
-  Future<void> _loadStateAndData() async {
+  Future<void> _loadState() async {
     final prefs = await SharedPreferences.getInstance();
-    _blockedCount = prefs.getInt('blocked_count') ?? 0;
-    _totalQueries = prefs.getInt('total_queries') ?? 0;
     _isActive = prefs.getBool('is_active') ?? false;
 
-    final whiteListSaved = prefs.getStringList('custom_whitelist') ?? [];
-    _whitelist.addAll(whiteListSaved);
-
-    _blockedDomains.addAll(_builtInBlacklist);
-
-    final file = await _getLocalRulesFile();
+    final file = await _getRulesFile();
     if (await file.exists()) {
       try {
         final lines = await file.readAsLines();
-        _blockedDomains.addAll(lines);
+        _rules.addAll(lines);
       } catch (e) {
         debugPrint('File read error: $e');
       }
     }
 
     setState(() {
-      _activeRuleCount = _blockedDomains.length;
+      _activeRuleCount = _rules.isNotEmpty ? _rules.length : 0;
     });
-
-    if (_isActive) {
-      _startVpnService();
-    }
-  }
-
-  Future<void> _persistStats() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('blocked_count', _blockedCount);
-    await prefs.setInt('total_queries', _totalQueries);
-    await prefs.setBool('is_active', _isActive);
   }
 
   Future<void> _toggleProtection() async {
@@ -243,7 +224,8 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       setState(() {
         _isActive = false;
       });
-      await _persistStats();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('is_active', false);
       _showToast('AdLocker выключен');
       return;
     }
@@ -252,29 +234,35 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       _isLoading = true;
     });
 
-    _showToast('Синхронизация черных списков...');
-    await _fetchHostsOnline();
+    if (_rules.isEmpty) {
+      _showToast('Загрузка базы правил StevenBlack...');
+      await _downloadHosts();
+    }
 
-    final started = await _startVpnService();
+    final prefs = await SharedPreferences.getInstance();
+    final bool useLocalSinkhole = prefs.getBool('use_local_sinkhole') ?? true;
+
+    final started = await _startVpnService(useLocalSinkhole);
 
     setState(() {
       _isLoading = false;
       _isActive = started;
     });
 
-    await _persistStats();
+    await prefs.setBool('is_active', _isActive);
 
     if (started) {
-      _showToast('Защита активирована! Фильтр запущен.');
-      _simulateDemoTraffic();
+      _showToast(useLocalSinkhole
+          ? 'DNS Синхоул 0.0.0.0 активен!'
+          : 'Режим AdGuard DNS активен');
     }
   }
 
-  Future<void> _fetchHostsOnline() async {
+  Future<void> _downloadHosts() async {
     try {
       final res = await http.get(
         Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'),
-      ).timeout(const Duration(seconds: 12));
+      ).timeout(const Duration(seconds: 15));
 
       if (res.statusCode == 200) {
         final lines = res.body.split('\n');
@@ -293,32 +281,30 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         }
 
         if (fetched.isNotEmpty) {
-          _blockedDomains.addAll(fetched);
-          final file = await _getLocalRulesFile();
+          _rules.clear();
+          _rules.addAll(fetched);
+
+          final file = await _getRulesFile();
           await file.writeAsString(fetched.join('\n'));
 
           if (mounted) {
             setState(() {
-              _activeRuleCount = _blockedDomains.length;
+              _activeRuleCount = _rules.length;
             });
           }
         }
       }
-    } catch (_) {
-      // Использовать кэшированные правила
-    }
+    } catch (_) {}
   }
 
-  Future<bool> _startVpnService() async {
+  Future<bool> _startVpnService(bool useLocalSinkhole) async {
     try {
-      final bool? success = await _platform.invokeMethod<bool>('startVpn');
-      if (success != true) {
-        _showToast('В разрешении VPN отказано', isError: true);
-      }
+      final bool? success = await _platform.invokeMethod<bool>('startVpn', {
+        'useLocalSinkhole': useLocalSinkhole,
+      });
       return success ?? false;
     } catch (e) {
-      _showToast('Ошибка вызова VPN: $e', isError: true);
-      debugPrint('Native VPN start failed: $e');
+      _showToast('Ошибка вызова: $e', isError: true);
       return false;
     }
   }
@@ -326,72 +312,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   Future<void> _stopVpnService() async {
     try {
       await _platform.invokeMethod('stopVpn');
-    } catch (e) {
-      debugPrint('Native VPN stop failed: $e');
-    }
-  }
-
-  void _simulateDemoTraffic() {
-    if (!_isActive) return;
-    final testDomains = [
-      'googleads.g.doubleclick.net',
-      'api.github.com',
-      'app-measurement.com',
-      'flutter.dev',
-      'unityads.unity3d.com',
-      'cloudflare.com',
-      'an.yandex.ru',
-    ];
-
-    int counter = 0;
-    Timer.periodic(const Duration(seconds: 4), (timer) {
-      if (!_isActive || !mounted) {
-        timer.cancel();
-        return;
-      }
-      final domain = testDomains[counter % testDomains.length];
-      _processDomainQuery(domain);
-      counter++;
-    });
-  }
-
-  void _processDomainQuery(String domain) {
-    final lower = domain.toLowerCase();
-    bool shouldBlock = false;
-
-    if (!_whitelist.contains(lower)) {
-      for (final rule in _blockedDomains) {
-        if (lower == rule || lower.endsWith('.$rule')) {
-          shouldBlock = true;
-          break;
-        }
-      }
-    }
-
-    _totalQueries++;
-    if (shouldBlock) {
-      _blockedCount++;
-    }
-
-    _persistStats();
-
-    if (mounted) {
-      setState(() {
-        _logs.insert(
-          0,
-          DnsLogEntry(
-            id: DateTime.now().microsecondsSinceEpoch.toString(),
-            domain: domain,
-            blocked: shouldBlock,
-            time: DateTime.now(),
-            responseTimeMs: shouldBlock ? 1 : 18,
-          ),
-        );
-        if (_logs.length > 100) {
-          _logs.removeLast();
-        }
-      });
-    }
+    } catch (_) {}
   }
 
   void _showToast(String msg, {bool isError = false}) {
@@ -411,7 +332,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     );
   }
 
-  void _showLogDetails(DnsLogEntry entry) {
+  void _showDomainDetails(DnsPacketItem item) {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF130826),
@@ -428,27 +349,26 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               Row(
                 children: [
                   Icon(
-                    entry.blocked ? Icons.block_rounded : Icons.check_circle_rounded,
-                    color: entry.blocked ? Colors.redAccent : const Color(0xFF00FF66),
+                    item.blocked ? Icons.block_rounded : Icons.check_circle_rounded,
+                    color: item.blocked ? Colors.redAccent : const Color(0xFF00FF66),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
-                      entry.blocked ? 'ЗАБЛОКИРОВАНО (0.0.0.0)' : 'РАЗРЕШЕНО (PASS)',
+                      item.blocked ? 'БЛОКИРОВКА 0.0.0.0' : 'ПРОПУЩЕН В ИНТЕРНЕТ',
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
                         fontSize: 14,
-                        color: entry.blocked ? Colors.redAccent : const Color(0xFF00FF66),
+                        color: item.blocked ? Colors.redAccent : const Color(0xFF00FF66),
                       ),
                     ),
                   ),
                 ],
               ),
               const Divider(color: Colors.white24, height: 24),
-              _buildDetailRow('ДОМЕН', entry.domain),
-              _buildDetailRow('ВРЕМЯ', entry.time.toLocal().toString().substring(11, 19)),
-              _buildDetailRow('ПИНГ', '${entry.responseTimeMs} мс'),
-              _buildDetailRow('КЛИЕНТ', entry.clientIp),
+              _buildDetailRow('ДОМЕН', item.domain),
+              _buildDetailRow('ВРЕМЯ', item.time.toLocal().toString().substring(11, 19)),
+              _buildDetailRow('ШЛЮЗ', '10.0.0.2:53 (UDP)'),
               const SizedBox(height: 16),
               SizedBox(
                 width: double.infinity,
@@ -458,13 +378,19 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                     padding: const EdgeInsets.symmetric(vertical: 12),
                   ),
                   icon: const Icon(Icons.add_moderator_rounded, size: 18),
-                  label: const Text('ДОБАВИТЬ В ИСКЛЮЧЕНИЯ'),
+                  label: const Text('ДОБАВИТЬ В БЕЛЫЙ СПИСОК'),
                   onPressed: () async {
+                    final dir = await getApplicationDocumentsDirectory();
+                    final wlFile = File('${dir.path}/whitelist.txt');
                     final prefs = await SharedPreferences.getInstance();
-                    _whitelist.add(entry.domain);
-                    await prefs.setStringList('custom_whitelist', _whitelist.toList());
+                    final cur = prefs.getStringList('custom_whitelist') ?? [];
+                    if (!cur.contains(item.domain)) {
+                      cur.add(item.domain);
+                      await prefs.setStringList('custom_whitelist', cur);
+                      await wlFile.writeAsString(cur.join('\n'));
+                    }
                     if (ctx.mounted) Navigator.pop(ctx);
-                    _showToast('Домен добавлен в белый список');
+                    _showToast('Домен добавлен в список исключений');
                   },
                 ),
               ),
@@ -482,7 +408,14 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(label, style: TextStyle(color: Colors.grey[500], fontSize: 12)),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+          Expanded(
+            child: Text(
+              value,
+              textAlign: TextAlign.end,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+            ),
+          ),
         ],
       ),
     );
@@ -491,7 +424,9 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   @override
   Widget build(BuildContext context) {
     final primary = Theme.of(context).primaryColor;
-    final filteredLogs = _logs.where((e) => e.domain.toLowerCase().contains(_searchFilter.toLowerCase())).toList();
+    final filtered = _realLogs
+        .where((e) => e.domain.toLowerCase().contains(_searchQuery.toLowerCase()))
+        .toList();
 
     return Scaffold(
       appBar: AppBar(
@@ -513,7 +448,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               ),
             ),
             const Text(
-              'ADLOCKER SHIELD',
+              'ADLOCKER ENGINE',
               style: TextStyle(
                 fontFamily: 'monospace',
                 letterSpacing: 2.0,
@@ -526,10 +461,10 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         actions: [
           IconButton(
             icon: const Icon(Icons.delete_sweep_rounded),
-            tooltip: 'Очистить логи',
+            tooltip: 'Очистить историю',
             onPressed: () {
               setState(() {
-                _logs.clear();
+                _realLogs.clear();
               });
               _showToast('Логи очищены');
             },
@@ -538,14 +473,14 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       ),
       body: Column(
         children: [
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
           Center(
             child: GestureDetector(
               onTap: _toggleProtection,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 300),
-                width: 140,
-                height: 140,
+                width: 130,
+                height: 130,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: _isActive ? primary.withAlpha(45) : Colors.white.withAlpha(10),
@@ -565,7 +500,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                 ),
                 child: _isLoading
                     ? const Padding(
-                        padding: EdgeInsets.all(42.0),
+                        padding: EdgeInsets.all(40.0),
                         child: CircularProgressIndicator(
                           strokeWidth: 3,
                           valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF9D4EDD)),
@@ -573,7 +508,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                       )
                     : Icon(
                         _isActive ? Icons.verified_user_rounded : Icons.shield_outlined,
-                        size: 64,
+                        size: 58,
                         color: _isActive ? const Color(0xFF00FF66) : Colors.grey[600],
                       ),
               ),
@@ -582,8 +517,8 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           const SizedBox(height: 10),
           Text(
             _isLoading
-                ? 'ЗАГРУЗКА 70 000+ ПРАВИЛ...'
-                : (_isActive ? 'СИСТЕМНЫЙ VPN АКТИВЕН' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
+                ? 'ИНИЦИАЛИЗАЦИЯ ДВИЖКА...'
+                : (_isActive ? 'СИНХОУЛ 0.0.0.0 АКТИВЕН' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
             style: TextStyle(
               fontWeight: FontWeight.bold,
               letterSpacing: 1.5,
@@ -596,7 +531,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
             padding: const EdgeInsets.symmetric(horizontal: 14),
             child: Row(
               children: [
-                _buildStatCard('БЛОКИРОВАНО', '$_blockedCount', Colors.redAccent),
+                _buildStatCard('БЛОК 0.0.0.0', '$_blockedQueries', Colors.redAccent),
                 const SizedBox(width: 8),
                 _buildStatCard('ВСЕГО DNS', '$_totalQueries', const Color(0xFF00E5FF)),
                 const SizedBox(width: 8),
@@ -604,18 +539,18 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               ],
             ),
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 12),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14),
             child: TextField(
               onChanged: (val) {
                 setState(() {
-                  _searchFilter = val;
+                  _searchQuery = val;
                 });
               },
               style: const TextStyle(fontSize: 12),
               decoration: InputDecoration(
-                hintText: 'Поиск по доменам логов...',
+                hintText: 'Поиск по реальным DNS-запросам...',
                 hintStyle: TextStyle(color: Colors.grey[600], fontSize: 12),
                 prefixIcon: const Icon(Icons.search_rounded, size: 18),
                 filled: true,
@@ -628,13 +563,15 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               ),
             ),
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
           Expanded(
-            child: filteredLogs.isEmpty
+            child: filtered.isEmpty
                 ? Center(
                     child: Text(
-                      _logs.isEmpty
-                          ? 'Ожидание сетевых DNS-пакетов...'
+                      _realLogs.isEmpty
+                          ? (_isActive
+                              ? 'Ожидание сетевых DNS-пакетов из системы...'
+                              : 'Включите защиту для перехвата трафика')
                           : 'Ничего не найдено',
                       style: TextStyle(color: Colors.grey[600], fontSize: 12),
                     ),
@@ -642,11 +579,11 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                 : ListView.builder(
                     physics: const BouncingScrollPhysics(),
                     padding: const EdgeInsets.symmetric(horizontal: 14),
-                    itemCount: filteredLogs.length,
+                    itemCount: filtered.length,
                     itemBuilder: (context, index) {
-                      final item = filteredLogs[index];
+                      final item = filtered[index];
                       return InkWell(
-                        onTap: () => _showLogDetails(item),
+                        onTap: () => _showDomainDetails(item),
                         child: Container(
                           margin: const EdgeInsets.only(bottom: 6),
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -675,7 +612,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                                 ),
                               ),
                               Text(
-                                item.blocked ? 'BLOCKED' : 'PASS',
+                                item.blocked ? '0.0.0.0' : 'PASS',
                                 style: TextStyle(
                                   fontSize: 10,
                                   fontWeight: FontWeight.bold,
@@ -707,6 +644,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           children: [
             Text(
               value,
+              textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 16,
                 fontWeight: FontWeight.bold,
@@ -763,6 +701,11 @@ class _WhitelistViewState extends State<WhitelistView> {
       _items.add(clean);
     });
     await prefs.setStringList('custom_whitelist', _items);
+
+    final dir = await getApplicationDocumentsDirectory();
+    final wlFile = File('${dir.path}/whitelist.txt');
+    await wlFile.writeAsString(_items.join('\n'));
+
     _controller.clear();
   }
 
@@ -772,14 +715,16 @@ class _WhitelistViewState extends State<WhitelistView> {
       _items.remove(domain);
     });
     await prefs.setStringList('custom_whitelist', _items);
+
+    final dir = await getApplicationDocumentsDirectory();
+    final wlFile = File('${dir.path}/whitelist.txt');
+    await wlFile.writeAsString(_items.join('\n'));
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('БЕЛЫЙ СПИСОК'),
-      ),
+      appBar: AppBar(title: const Text('БЕЛЫЙ СПИСОК')),
       body: Column(
         children: [
           Padding(
@@ -791,7 +736,7 @@ class _WhitelistViewState extends State<WhitelistView> {
                     controller: _controller,
                     style: const TextStyle(fontSize: 12),
                     decoration: InputDecoration(
-                      hintText: 'Пример: example.com',
+                      hintText: 'Пример: yandex.ru',
                       hintStyle: TextStyle(color: Colors.grey[600], fontSize: 12),
                       filled: true,
                       fillColor: const Color(0xFF130724),
@@ -838,42 +783,81 @@ class _WhitelistViewState extends State<WhitelistView> {
   }
 }
 
-class SettingsView extends StatelessWidget {
+class SettingsView extends StatefulWidget {
   const SettingsView({super.key});
+
+  @override
+  State<SettingsView> createState() => _SettingsViewState();
+}
+
+class _SettingsViewState extends State<SettingsView> {
+  bool _useLocalSinkhole = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _useLocalSinkhole = prefs.getBool('use_local_sinkhole') ?? true;
+    });
+  }
+
+  Future<void> _updateMode(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _useLocalSinkhole = value;
+    });
+    await prefs.setBool('use_local_sinkhole', value);
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('ПАРАМЕТРЫ ФИЛЬТРА'),
-      ),
+      appBar: AppBar(title: const Text('РЕЖИМЫ ФИЛЬТРАЦИИ')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          SwitchListTile(
-            title: const Text('Блокировать трекеры аналитики', style: TextStyle(fontSize: 13)),
-            subtitle: Text('AppMetrica, Adjust, AppsFlyer', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+          RadioListTile<bool>(
+            title: const Text('Локальный 0.0.0.0 (По умолчанию)', style: TextStyle(fontSize: 13)),
+            subtitle: Text(
+              'Собственный DNS-фильтр на устройстве. При сбое сокета автоматически переключается на AdGuard.',
+              style: TextStyle(color: Colors.grey[400], fontSize: 11),
+            ),
             value: true,
+            groupValue: _useLocalSinkhole,
             activeColor: const Color(0xFF9D4EDD),
-            onChanged: (val) {},
+            onChanged: (val) => _updateMode(val ?? true),
           ),
-          SwitchListTile(
-            title: const Text('Блокировать рекламные SDK', style: TextStyle(fontSize: 13)),
-            subtitle: Text('UnityAds, AdMob, AppLovin, IronSource', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
-            value: true,
+          RadioListTile<bool>(
+            title: const Text('Внешний AdGuard DNS', style: TextStyle(fontSize: 13)),
+            subtitle: Text(
+              'Пересылка всех DNS-пакетов на 94.140.14.14',
+              style: TextStyle(color: Colors.grey[400], fontSize: 11),
+            ),
+            value: false,
+            groupValue: _useLocalSinkhole,
             activeColor: const Color(0xFF9D4EDD),
-            onChanged: (val) {},
+            onChanged: (val) => _updateMode(val ?? false),
           ),
           const Divider(color: Colors.white12, height: 30),
           ListTile(
-            title: const Text('Вышестоящий DNS (Upstream)', style: TextStyle(fontSize: 13)),
-            subtitle: Text('Cloudflare DNS (1.1.1.1) / AdGuard DNS', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
-            trailing: const Icon(Icons.dns_rounded, color: Color(0xFFC77DFF)),
+            title: const Text('Основной Upstream DNS', style: TextStyle(fontSize: 13)),
+            subtitle: Text('xbox-dns.ru (111.88.96.50)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            trailing: const Icon(Icons.dns_rounded, color: Color(0xFF00E5FF)),
           ),
           ListTile(
-            title: const Text('Версия AdLocker', style: TextStyle(fontSize: 13)),
-            subtitle: Text('v1.0.0 (Release ARM64/v7)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
-            trailing: const Icon(Icons.verified_rounded, color: Color(0xFF00FF66)),
+            title: const Text('Резервный DNS (Fallback)', style: TextStyle(fontSize: 13)),
+            subtitle: Text('AdGuard DNS (94.140.14.14)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            trailing: const Icon(Icons.shield_moon_rounded, color: Color(0xFFC77DFF)),
+          ),
+          ListTile(
+            title: const Text('Split Tunneling', style: TextStyle(fontSize: 13)),
+            subtitle: Text('Прямой доступ для системных исключений включен', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            trailing: const Icon(Icons.check_circle_rounded, color: Color(0xFF00FF66)),
           ),
         ],
       ),
