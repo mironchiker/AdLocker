@@ -43,8 +43,15 @@ class AdLockerVpnService : VpnService() {
     private fun loadRules() {
         thread {
             try {
-                val rulesFile = File(filesDir, "adblock_hosts_rules.txt")
-                if (rulesFile.exists()) {
+                val candidates = listOf(
+                    File(filesDir, "app_flutter/adblock_hosts_rules.txt"),
+                    File(filesDir, "adblock_hosts_rules.txt"),
+                    File(noBackupFilesDir, "adblock_hosts_rules.txt"),
+                    File(filesDir.parentFile, "app_flutter/adblock_hosts_rules.txt")
+                )
+
+                val rulesFile = candidates.firstOrNull { it.exists() }
+                if (rulesFile != null) {
                     val lines = rulesFile.readLines()
                     synchronized(blackList) {
                         blackList.clear()
@@ -57,8 +64,14 @@ class AdLockerVpnService : VpnService() {
                         activeRulesCount = blackList.size
                     }
                 }
-                val wlFile = File(filesDir, "whitelist.txt")
-                if (wlFile.exists()) {
+
+                val wlCandidates = listOf(
+                    File(filesDir, "app_flutter/whitelist.txt"),
+                    File(filesDir, "whitelist.txt"),
+                    File(filesDir.parentFile, "app_flutter/whitelist.txt")
+                )
+                val wlFile = wlCandidates.firstOrNull { it.exists() }
+                if (wlFile != null) {
                     val lines = wlFile.readLines()
                     synchronized(whiteList) {
                         whiteList.clear()
@@ -81,12 +94,10 @@ class AdLockerVpnService : VpnService() {
             builder.setSession("AdLocker DNS")
             builder.setMtu(1500)
             
-            // Назначаем виртуальный шлюз и перехватываем только DNS
             builder.addAddress("10.254.1.2", 32)
             builder.addDnsServer("10.254.1.1")
             builder.addRoute("10.254.1.1", 32)
 
-            // Прямой доступ для остального трафика (сеть не падает)
             builder.allowBypass()
 
             try {
@@ -121,7 +132,6 @@ class AdLockerVpnService : VpnService() {
                     val length = inStream.read(packetBuffer)
                     if (length <= 0) continue
 
-                    // Валидация IPv4 (байт 0 = 0x45) и UDP (протокол 17)
                     if ((packetBuffer[0].toInt() shr 4) != 4) continue
                     if (packetBuffer[9].toInt() != 17) continue
 
@@ -142,14 +152,12 @@ class AdLockerVpnService : VpnService() {
                         notifyFlutter(domain, isBlocked)
 
                         if (isBlocked) {
-                            // Локальный синтез ответа 0.0.0.0
                             val dnsResponse = craftSinkholeDnsResponse(dnsQuery)
                             val fullPacket = craftUdpIpPacket(packetBuffer, ihl, dnsResponse)
                             synchronized(outStream) {
                                 outStream.write(fullPacket)
                             }
                         } else {
-                            // Неблокирующий форвардинг в пуле потоков
                             val packetCopy = ByteArray(length)
                             System.arraycopy(packetBuffer, 0, packetCopy, 0, length)
 
@@ -170,7 +178,6 @@ class AdLockerVpnService : VpnService() {
                                         socket.receive(inPacket)
                                         received = true
                                     } catch (_: Exception) {
-                                        // Фоллбек на AdGuard при сбое основного upstream
                                         val fbPacket = DatagramPacket(dnsQuery, dnsLength, fallbackAdguard, 53)
                                         socket.send(fbPacket)
                                         socket.receive(inPacket)
@@ -197,17 +204,22 @@ class AdLockerVpnService : VpnService() {
 
     private fun shouldBlock(domain: String): Boolean {
         if (domain.isEmpty()) return false
-        val d = domain.lowercase()
+        val d = domain.trim().trimEnd('.').lowercase()
+
         synchronized(whiteList) {
             if (whiteList.contains(d)) return false
         }
+
         synchronized(blackList) {
             if (blackList.contains(d)) return true
-            var dotIdx = d.indexOf('.')
-            while (dotIdx != -1) {
-                val parent = d.substring(dotIdx + 1)
-                if (blackList.contains(parent)) return true
-                dotIdx = d.indexOf('.', dotIdx + 1)
+
+            var current = d
+            while (current.contains('.')) {
+                val nextDot = current.indexOf('.')
+                current = current.substring(nextDot + 1)
+                if (blackList.contains(current)) {
+                    return true
+                }
             }
         }
         return false
@@ -231,27 +243,22 @@ class AdLockerVpnService : VpnService() {
 
     private fun craftSinkholeDnsResponse(query: ByteArray): ByteArray {
         val bb = ByteBuffer.allocate(query.size + 16)
-        // Header
-        bb.put(query[0]) // ID
+        bb.put(query[0])
         bb.put(query[1])
-        bb.put(0x81.toByte()) // QR=1, RD=1
-        bb.put(0x80.toByte()) // RA=1, RCODE=0 (NOERROR)
-        bb.putShort(1) // QDCOUNT
-        bb.putShort(1) // ANCOUNT
-        bb.putShort(0) // NSCOUNT
-        bb.putShort(0) // ARCOUNT
-        
-        // Question section
+        bb.put(0x81.toByte())
+        bb.put(0x80.toByte())
+        bb.putShort(1)
+        bb.putShort(1)
+        bb.putShort(0)
+        bb.putShort(0)
         bb.put(query, 12, query.size - 12)
-
-        // Answer section: Name pointer to 0x0C
         bb.put(0xC0.toByte())
         bb.put(0x0C.toByte())
-        bb.putShort(1) // TYPE A
-        bb.putShort(1) // CLASS IN
-        bb.putInt(60)  // TTL
-        bb.putShort(4) // RDLENGTH 4
-        bb.put(0.toByte()) // 0.0.0.0
+        bb.putShort(1)
+        bb.putShort(1)
+        bb.putInt(60)
+        bb.putShort(4)
+        bb.put(0.toByte())
         bb.put(0.toByte())
         bb.put(0.toByte())
         bb.put(0.toByte())
@@ -265,28 +272,24 @@ class AdLockerVpnService : VpnService() {
         val totalLen = 20 + 8 + payload.size
         val out = ByteArray(totalLen)
 
-        // IPv4 Header
         out[0] = 0x45.toByte()
         out[1] = 0
         out[2] = ((totalLen shr 8) and 0xFF).toByte()
         out[3] = (totalLen and 0xFF).toByte()
         out[4] = 0
         out[5] = 0
-        out[6] = 0x40.toByte() // Don't Fragment
+        out[6] = 0x40.toByte()
         out[7] = 0
-        out[8] = 64 // TTL
-        out[9] = 17 // UDP
+        out[8] = 64
+        out[9] = 17
 
-        // Переворачиваем IP: Source <-> Dest
         System.arraycopy(req, 16, out, 12, 4)
         System.arraycopy(req, 12, out, 16, 4)
 
-        // Чексумма заголовка IPv4 по RFC 1071 (ядро не отбросит пакет)
         val ipChecksum = computeIpChecksum(out, 20)
         out[10] = ((ipChecksum shr 8) and 0xFF).toByte()
         out[11] = (ipChecksum and 0xFF).toByte()
 
-        // UDP Header
         out[20] = req[ihl + 2]
         out[21] = req[ihl + 3]
         out[22] = req[ihl]
@@ -343,4 +346,3 @@ class AdLockerVpnService : VpnService() {
         super.onDestroy()
     }
 }
-
