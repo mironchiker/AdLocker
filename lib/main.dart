@@ -92,11 +92,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           selectedFontSize: 11,
           unselectedFontSize: 11,
           type: BottomNavigationBarType.fixed,
-          onTap: (index) {
-            setState(() {
-              _currentIndex = index;
-            });
-          },
+          onTap: (index) => setState(() => _currentIndex = index),
           items: const [
             BottomNavigationBarItem(
               icon: Icon(Icons.shield_rounded),
@@ -104,7 +100,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
             ),
             BottomNavigationBarItem(
               icon: Icon(Icons.playlist_add_check_rounded),
-              label: 'ПРАВИЛА',
+              label: 'БЕЛЫЙ СПИСОК',
             ),
             BottomNavigationBarItem(
               icon: Icon(Icons.tune_rounded),
@@ -155,12 +151,12 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
   void _startNativeStreamListener() {
     _dnsSubscription = _eventChannel.receiveBroadcastStream().listen((dynamic event) {
-      if (event is Map) {
+      if (event is Map && mounted) {
         final domain = event['domain']?.toString() ?? '';
         final blocked = event['blocked'] == true;
         final timeMs = (event['time'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
 
-        if (domain.isNotEmpty && mounted) {
+        if (domain.isNotEmpty) {
           setState(() {
             _totalQueries++;
             if (blocked) _blockedCount++;
@@ -174,7 +170,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               ),
             );
 
-            if (_logs.length > 200) {
+            if (_logs.length > 300) {
               _logs.removeLast();
             }
           });
@@ -220,21 +216,17 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       try {
         await _platform.invokeMethod('stopVpn');
       } catch (_) {}
-      setState(() {
-        _isActive = false;
-      });
+      setState(() => _isActive = false);
       _showToast('Фильтрация остановлена');
       return;
     }
 
-    setState(() {
-      _isLoading = true;
-    });
+    setState(() => _isLoading = true);
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка базы StevenBlack...');
-      await _downloadRules(file);
+      _showToast('Загрузка баз (StevenBlack + RU Ads)...');
+      await _downloadEnhancedRules(file);
     }
 
     try {
@@ -247,41 +239,75 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         _showToast('Синхоул 0.0.0.0 активен');
       }
     } catch (e) {
-      setState(() {
-        _isLoading = false;
-      });
+      setState(() => _isLoading = false);
       _showToast('Ошибка запуска: $e', isError: true);
     }
   }
 
-  Future<void> _downloadRules(File file) async {
-    try {
-      final res = await http.get(
-        Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'),
-      ).timeout(const Duration(seconds: 15));
+  Future<void> _downloadEnhancedRules(File file) async {
+    final urls = [
+      // Базовая международная база StevenBlack
+      'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+      // Мобильная реклама и трекеры
+      'https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/MobileFilter/sections/adservers.txt'
+    ];
 
-      if (res.statusCode == 200) {
-        final lines = res.body.split('\n');
-        final cleanHosts = <String>[];
-        for (var l in lines) {
-          l = l.trim();
-          if (l.startsWith('0.0.0.0 ')) {
-            final parts = l.split(RegExp(r'\s+'));
-            if (parts.length >= 2 && parts[1] != '0.0.0.0') {
-              cleanHosts.add(parts[1]);
+    final hostsSet = <String>{};
+
+    for (final url in urls) {
+      try {
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 12));
+        if (res.statusCode == 200) {
+          final lines = res.body.split('\n');
+          for (var l in lines) {
+            l = l.trim().toLowerCase();
+            if (l.isEmpty || l.startsWith('#') || l.startsWith('!')) continue;
+
+            // Удаляем комментарии в конце строки
+            final commentIdx = l.indexOf('#');
+            if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
+
+            // Парсинг hosts формата (0.0.0.0 domain или 127.0.0.1 domain)
+            if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
+              final parts = l.split(RegExp(r'\s+'));
+              if (parts.length >= 2 && parts[1] != '0.0.0.0' && parts[1] != 'localhost') {
+                hostsSet.add(parts[1]);
+              }
+            } else if (l.startsWith('||') && l.endsWith('^')) {
+              // Adguard синтаксис: ||domain.com^
+              final clean = l.replaceAll('||', '').replaceAll('^', '').split('/')[0];
+              if (clean.isNotEmpty && !clean.contains('*')) {
+                hostsSet.add(clean);
+              }
             }
           }
         }
-        if (cleanHosts.isNotEmpty) {
-          await file.writeAsString(cleanHosts.join('\n'));
-          if (mounted) {
-            setState(() {
-              _rulesCount = cleanHosts.length;
-            });
-          }
-        }
+      } catch (_) {}
+    }
+
+    // Добавляем железные правила мобильных баннеров и Google/Yandex SDK вручную
+    hostsSet.addAll([
+      'googleads.g.doubleclick.net',
+      'pagead2.googlesyndication.com',
+      'adservice.google.com',
+      'an.yandex.ru',
+      'mc.yandex.ru',
+      'ads.admob.com',
+      'applovin.com',
+      'unityads.unity3d.com',
+      'ads.tiktok.com',
+      'adcolony.com',
+      'vungle.com',
+      'chartboost.com',
+      'ironsrc.com'
+    ]);
+
+    if (hostsSet.isNotEmpty) {
+      await file.writeAsString(hostsSet.join('\n'));
+      if (mounted) {
+        setState(() => _rulesCount = hostsSet.length);
       }
-    } catch (_) {}
+    }
   }
 
   void _showToast(String msg, {bool isError = false}) {
@@ -325,12 +351,19 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.delete_sweep_rounded),
-            onPressed: () {
-              setState(() {
-                _logs.clear();
-              });
+            tooltip: 'Обновить базы правил',
+            icon: const Icon(Icons.sync_rounded),
+            onPressed: () async {
+              _showToast('Обновление баз...');
+              final file = await _getRulesFile();
+              await _downloadEnhancedRules(file);
+              _showToast('Загружено $_rulesCount правил');
             },
+          ),
+          IconButton(
+            tooltip: 'Очистить лог',
+            icon: const Icon(Icons.delete_sweep_rounded),
+            onPressed: () => setState(() => _logs.clear()),
           ),
         ],
       ),
@@ -368,7 +401,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           const SizedBox(height: 10),
           Text(
             _isLoading
-                ? 'ЗАПУСК ДВИЖКА...'
+                ? 'ОБНОВЛЕНИЕ БАЗЫ...'
                 : (_isActive ? 'СИНХОУЛ 0.0.0.0 АКТИВЕН' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
             style: TextStyle(
               fontWeight: FontWeight.bold,
@@ -430,7 +463,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                           color: Theme.of(context).cardColor,
                           borderRadius: BorderRadius.circular(6),
                           border: Border.all(
-                            color: item.blocked ? Colors.redAccent.withAlpha(80) : Colors.white.withAlpha(12),
+                            color: item.blocked ? Colors.redAccent.withAlpha(90) : Colors.white.withAlpha(12),
                           ),
                         ),
                         child: Row(
@@ -544,7 +577,7 @@ class _WhitelistViewState extends State<WhitelistView> {
                     controller: _controller,
                     style: const TextStyle(fontSize: 12),
                     decoration: InputDecoration(
-                      hintText: 'Пример: yandex.ru',
+                      hintText: 'Разрешить домен (напр: yandex.ru)',
                       filled: true,
                       fillColor: const Color(0xFF130724),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
@@ -561,7 +594,7 @@ class _WhitelistViewState extends State<WhitelistView> {
           ),
           Expanded(
             child: _items.isEmpty
-                ? Center(child: Text('Список пуст', style: TextStyle(color: Colors.grey[600], fontSize: 12)))
+                ? Center(child: Text('Список исключений пуст', style: TextStyle(color: Colors.grey[600], fontSize: 12)))
                 : ListView.builder(
                     itemCount: _items.length,
                     itemBuilder: (ctx, idx) => ListTile(
@@ -625,14 +658,14 @@ class _SettingsViewState extends State<SettingsView> {
         children: [
           SwitchListTile(
             title: const Text('Фильтрация трекеров', style: TextStyle(fontSize: 13)),
-            subtitle: Text('Блокировка сбора телеметрии', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            subtitle: Text('Блокировка сбора телеметрии и метрик', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             value: _blockTrackers,
             activeColor: const Color(0xFF9D4EDD),
             onChanged: _setTrackers,
           ),
           SwitchListTile(
-            title: const Text('Блокировка рекламных SDK', style: TextStyle(fontSize: 13)),
-            subtitle: Text('AdMob, UnityAds, AppLovin', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            title: const Text('Блокировка мобильных SDK', style: TextStyle(fontSize: 13)),
+            subtitle: Text('AdMob, AppLovin, UnityAds, Mintegral', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             value: _blockSdk,
             activeColor: const Color(0xFF9D4EDD),
             onChanged: _setSdk,
