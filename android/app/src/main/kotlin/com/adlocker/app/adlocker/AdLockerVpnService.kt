@@ -5,13 +5,16 @@ import android.net.VpnService
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import java.io.BufferedReader
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
@@ -25,8 +28,11 @@ class AdLockerVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isWorkerRunning = false
-    private val blackList = HashSet<String>()
-    private val whiteList = HashSet<String>()
+    
+    // ConcurrentHashMap с фиктивным значением для O(1) поиска без блокировок
+    private val blackList = ConcurrentHashMap<String, Boolean>(150000)
+    private val whiteList = ConcurrentHashMap<String, Boolean>(1000)
+    
     private val mainHandler = Handler(Looper.getMainLooper())
     private val forwarderPool = Executors.newFixedThreadPool(8)
 
@@ -41,43 +47,58 @@ class AdLockerVpnService : VpnService() {
     }
 
     private fun loadRules() {
-        thread {
+        thread(name = "AdLocker-RulesLoader") {
             try {
-                val candidates = listOf(
-                    File(filesDir, "app_flutter/adblock_hosts_rules.txt"),
-                    File(filesDir, "adblock_hosts_rules.txt"),
-                    File(noBackupFilesDir, "adblock_hosts_rules.txt"),
-                    File(filesDir.parentFile, "app_flutter/adblock_hosts_rules.txt")
+                val candidateDirs = listOf(
+                    File(filesDir, "app_flutter"),
+                    filesDir,
+                    noBackupFilesDir,
+                    File(filesDir.parentFile, "app_flutter")
                 )
 
-                val rulesFile = candidates.firstOrNull { it.exists() }
-                if (rulesFile != null) {
-                    val lines = rulesFile.readLines()
-                    synchronized(blackList) {
-                        blackList.clear()
-                        for (line in lines) {
-                            val trimmed = line.trim().lowercase()
-                            if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                                blackList.add(trimmed)
-                            }
-                        }
-                        activeRulesCount = blackList.size
+                var rulesFile: File? = null
+                for (dir in candidateDirs) {
+                    val f = File(dir, "adblock_hosts_rules.txt")
+                    if (f.exists() && f.length() > 0) {
+                        rulesFile = f
+                        break
                     }
                 }
 
-                val wlCandidates = listOf(
-                    File(filesDir, "app_flutter/whitelist.txt"),
-                    File(filesDir, "whitelist.txt"),
-                    File(filesDir.parentFile, "app_flutter/whitelist.txt")
-                )
-                val wlFile = wlCandidates.firstOrNull { it.exists() }
+                if (rulesFile != null) {
+                    blackList.clear()
+                    BufferedReader(InputStreamReader(FileInputStream(rulesFile))).use { reader ->
+                        var line = reader.readLine()
+                        while (line != null) {
+                            val trimmed = line.trim().lowercase()
+                            if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
+                                blackList[trimmed] = true
+                            }
+                            line = reader.readLine()
+                        }
+                    }
+                    activeRulesCount = blackList.size
+                }
+
+                var wlFile: File? = null
+                for (dir in candidateDirs) {
+                    val f = File(dir, "whitelist.txt")
+                    if (f.exists() && f.length() > 0) {
+                        wlFile = f
+                        break
+                    }
+                }
+
                 if (wlFile != null) {
-                    val lines = wlFile.readLines()
-                    synchronized(whiteList) {
-                        whiteList.clear()
-                        for (l in lines) {
-                            val t = l.trim().lowercase()
-                            if (t.isNotEmpty()) whiteList.add(t)
+                    whiteList.clear()
+                    BufferedReader(InputStreamReader(FileInputStream(wlFile))).use { reader ->
+                        var line = reader.readLine()
+                        while (line != null) {
+                            val trimmed = line.trim().lowercase()
+                            if (trimmed.isNotEmpty()) {
+                                whiteList[trimmed] = true
+                            }
+                            line = reader.readLine()
                         }
                     }
                 }
@@ -206,22 +227,21 @@ class AdLockerVpnService : VpnService() {
         if (domain.isEmpty()) return false
         val d = domain.trim().trimEnd('.').lowercase()
 
-        synchronized(whiteList) {
-            if (whiteList.contains(d)) return false
-        }
+        if (whiteList.containsKey(d)) return false
 
-        synchronized(blackList) {
-            if (blackList.contains(d)) return true
+        // 1. Точное попадание
+        if (blackList.containsKey(d)) return true
 
-            var current = d
-            while (current.contains('.')) {
-                val nextDot = current.indexOf('.')
-                current = current.substring(nextDot + 1)
-                if (blackList.contains(current)) {
-                    return true
-                }
+        // 2. Иерархический поиск поддоменов: a.b.doubleclick.net -> b.doubleclick.net -> doubleclick.net
+        var dotIndex = d.indexOf('.')
+        while (dotIndex != -1) {
+            val parent = d.substring(dotIndex + 1)
+            if (blackList.containsKey(parent)) {
+                return true
             }
+            dotIndex = d.indexOf('.', dotIndex + 1)
         }
+
         return false
     }
 
