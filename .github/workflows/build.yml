@@ -37,31 +37,22 @@ jobs:
 
       - name: Sign APK (v1 + v2 + v3)
         run: |
-          # 1. Генерируем релизный ключ
           keytool -genkeypair -v -keystore release.keystore -alias adlocker \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass adlocker123 -keypass adlocker123 \
             -dname "CN=AdLocker, OU=App, O=AdLocker, L=City, S=State, C=RU"
 
-          # 2. Находим путь к build-tools через apksigner
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -maxdepth 2 -name "apksigner" -type f | sort -V | tail -n 1)
           TOOLS_DIR=$(dirname "$APKSIGNER")
           ZIPALIGN="$TOOLS_DIR/zipalign"
-
-          echo "Using apksigner: $APKSIGNER"
-          echo "Using zipalign: $ZIPALIGN"
 
           ORIGINAL_APK="build/app/outputs/flutter-apk/app-release-unsigned.apk"
           if [ ! -f "$ORIGINAL_APK" ]; then
             ORIGINAL_APK="build/app/outputs/flutter-apk/app-release.apk"
           fi
 
-          echo "Using APK: $ORIGINAL_APK"
-
-          # 3. Выравнивание 4-byte (zipalign из той же папки)
           "$ZIPALIGN" -f -p 4 "$ORIGINAL_APK" build/app/outputs/flutter-apk/app-aligned.apk
 
-          # 4. Подпись через apksigner
           "$APKSIGNER" sign --ks release.keystore \
             --ks-key-alias adlocker \
             --ks-pass pass:adlocker123 \
@@ -72,7 +63,6 @@ jobs:
             --out build/app/outputs/flutter-apk/AdLocker.apk \
             build/app/outputs/flutter-apk/app-aligned.apk
 
-          # 5. Проверка подписи
           "$APKSIGNER" verify -v build/app/outputs/flutter-apk/AdLocker.apk
 
       - name: Release Signed APK
@@ -80,7 +70,7 @@ jobs:
         with:
           tag_name: v1.0.0-${{ github.run_number }}
           name: AdLocker v1.0.0 (Build ${{ github.run_number }})
-          body: "Готовый подписанный релиз AdLocker (RFC 1071 IP Checksum + xbox-dns.ru + local sinkhole)."
+          body: "Релиз с исправленной проверкой доменов и корректными путями к базе правил."
           files: build/app/outputs/flutter-apk/AdLocker.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
