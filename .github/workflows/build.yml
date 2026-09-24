@@ -43,9 +43,13 @@ jobs:
             -storepass adlocker123 -keypass adlocker123 \
             -dname "CN=AdLocker, OU=App, O=AdLocker, L=City, S=State, C=RU"
 
-          # 2. Находим реальный исполняемый файл apksigner в корне актуальной папки build-tools
+          # 2. Находим путь к build-tools через apksigner
           APKSIGNER=$(find "$ANDROID_SDK_ROOT/build-tools" -maxdepth 2 -name "apksigner" -type f | sort -V | tail -n 1)
-          echo "Found apksigner: $APKSIGNER"
+          TOOLS_DIR=$(dirname "$APKSIGNER")
+          ZIPALIGN="$TOOLS_DIR/zipalign"
+
+          echo "Using apksigner: $APKSIGNER"
+          echo "Using zipalign: $ZIPALIGN"
 
           ORIGINAL_APK="build/app/outputs/flutter-apk/app-release-unsigned.apk"
           if [ ! -f "$ORIGINAL_APK" ]; then
@@ -54,10 +58,10 @@ jobs:
 
           echo "Using APK: $ORIGINAL_APK"
 
-          # 3. Выравнивание 4-byte (zipalign доступен напрямую из окружения runner)
-          zipalign -f -p 4 "$ORIGINAL_APK" build/app/outputs/flutter-apk/app-aligned.apk
+          # 3. Выравнивание 4-byte (zipalign из той же папки)
+          "$ZIPALIGN" -f -p 4 "$ORIGINAL_APK" build/app/outputs/flutter-apk/app-aligned.apk
 
-          # 4. Подпись через найденный apksigner
+          # 4. Подпись через apksigner
           "$APKSIGNER" sign --ks release.keystore \
             --ks-key-alias adlocker \
             --ks-pass pass:adlocker123 \
