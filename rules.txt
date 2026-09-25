@@ -1,0 +1,14 @@
+0.0.0.0
+adcolony.com
+adservice.google.com
+ads.admob.com
+ads.tiktok.com
+an.yandex.ru
+applovin.com
+chartboost.com
+googleads.g.doubleclick.net
+ironsrc.com
+mc.yandex.ru
+pagead2.googlesyndication.com
+unityads.unity3d.com
+vungle.com
