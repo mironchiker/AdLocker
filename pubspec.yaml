@@ -1,17 +1,19 @@
 name: adlocker
-description: "AdLocker Native DNS VPN App"
-publish_to: 'none'
+description: "A battery-efficient Android DNS Sinkhole Ad Blocker built with Flutter."
+publish_to: "none"
+
 version: 1.0.0+1
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
-  http: ^1.2.0
+  http: ^1.2.1
   path_provider: ^2.1.2
-  shared_preferences: ^2.2.2
+  shared_preferences: ^2.2.3
+  yandex_mobileads: ^2.1.0
 
 dev_dependencies:
   flutter_test:
