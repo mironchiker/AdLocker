@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -12,7 +13,7 @@ void main() {
     WidgetsFlutterBinding.ensureInitialized();
     runApp(const AdLockerApp());
   }, (error, stack) {
-    debugPrint('AdLocker Global Error: $error');
+    debugPrint('AdLocker Error: $error');
   });
 }
 
@@ -50,7 +51,7 @@ class DnsLogEntry {
   final bool blocked;
   final DateTime time;
 
-  DnsLogEntry({
+  const DnsLogEntry({
     required this.domain,
     required this.blocked,
     required this.time,
@@ -80,9 +81,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
       ),
       bottomNavigationBar: Container(
         decoration: BoxDecoration(
-          border: Border(
-            top: BorderSide(color: Colors.white.withAlpha(20), width: 1),
-          ),
+          border: Border(top: BorderSide(color: Colors.white.withAlpha(20), width: 1)),
         ),
         child: BottomNavigationBar(
           currentIndex: _currentIndex,
@@ -94,18 +93,9 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           type: BottomNavigationBarType.fixed,
           onTap: (index) => setState(() => _currentIndex = index),
           items: const [
-            BottomNavigationBarItem(
-              icon: Icon(Icons.shield_rounded),
-              label: 'ЩИТ',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.playlist_add_check_rounded),
-              label: 'БЕЛЫЙ СПИСОК',
-            ),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.tune_rounded),
-              label: 'ОПЦИИ',
-            ),
+            BottomNavigationBarItem(icon: Icon(Icons.shield_rounded), label: 'ЩИТ'),
+            BottomNavigationBarItem(icon: Icon(Icons.playlist_add_check_rounded), label: 'БЕЛЫЙ СПИСОК'),
+            BottomNavigationBarItem(icon: Icon(Icons.tune_rounded), label: 'ОПЦИИ'),
           ],
         ),
       ),
@@ -129,6 +119,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   int _blockedCount = 0;
   int _totalQueries = 0;
   int _rulesCount = 0;
+  bool _isAppInForeground = true;
 
   StreamSubscription? _dnsSubscription;
   final List<DnsLogEntry> _logs = [];
@@ -143,6 +134,11 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _isAppInForeground = (state == AppLifecycleState.resumed);
+  }
+
+  @override
   void dispose() {
     _dnsSubscription?.cancel();
     WidgetsBinding.instance.removeObserver(this);
@@ -151,33 +147,35 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
   void _startNativeStreamListener() {
     _dnsSubscription = _eventChannel.receiveBroadcastStream().listen((dynamic event) {
-      if (event is Map && mounted) {
+      if (event is Map) {
         final domain = event['domain']?.toString() ?? '';
         final blocked = event['blocked'] == true;
         final timeMs = (event['time'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
 
         if (domain.isNotEmpty) {
-          setState(() {
-            _totalQueries++;
-            if (blocked) _blockedCount++;
+          _totalQueries++;
+          if (blocked) _blockedCount++;
 
-            _logs.insert(
-              0,
-              DnsLogEntry(
-                domain: domain,
-                blocked: blocked,
-                time: DateTime.fromMillisecondsSinceEpoch(timeMs),
-              ),
-            );
+          // Обновляем список и UI только если экран активен
+          if (_isAppInForeground && mounted) {
+            setState(() {
+              _logs.insert(
+                0,
+                DnsLogEntry(
+                  domain: domain,
+                  blocked: blocked,
+                  time: DateTime.fromMillisecondsSinceEpoch(timeMs),
+                ),
+              );
 
-            if (_logs.length > 300) {
-              _logs.removeLast();
-            }
-          });
+              // Жесткий лимит на 80 элементов для экономии ОЗУ
+              if (_logs.length > 80) {
+                _logs.removeRange(80, _logs.length);
+              }
+            });
+          }
         }
       }
-    }, onError: (dynamic error) {
-      debugPrint('DNS Stream Error: $error');
     });
   }
 
@@ -198,14 +196,14 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     try {
       final bool running = await _platform.invokeMethod('isVpnActive') ?? false;
-      setState(() {
-        _isActive = running;
-        _rulesCount = count;
-      });
+      if (mounted) {
+        setState(() {
+          _isActive = running;
+          _rulesCount = count;
+        });
+      }
     } catch (_) {
-      setState(() {
-        _rulesCount = count;
-      });
+      if (mounted) setState(() => _rulesCount = count);
     }
   }
 
@@ -225,67 +223,67 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка баз (StevenBlack + RU Ads)...');
+      _showToast('Загрузка баз (StevenBlack, OISD, HaGeZi)...');
       await _downloadEnhancedRules(file);
     }
 
     try {
       final bool? started = await _platform.invokeMethod<bool>('startVpn');
-      setState(() {
-        _isLoading = false;
-        _isActive = started ?? false;
-      });
-      if (_isActive) {
-        _showToast('Синхоул 0.0.0.0 активен');
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isActive = started ?? false;
+        });
       }
     } catch (e) {
-      setState(() => _isLoading = false);
-      _showToast('Ошибка запуска: $e', isError: true);
+      if (mounted) {
+        setState(() => _isLoading = false);
+        _showToast('Ошибка запуска: $e', isError: true);
+      }
     }
   }
 
   Future<void> _downloadEnhancedRules(File file) async {
     final urls = [
-      // Базовая международная база StevenBlack
       'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
-      // Мобильная реклама и трекеры
-      'https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/MobileFilter/sections/adservers.txt'
+      'https://big.oisd.nl',
+      'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt',
     ];
 
     final hostsSet = <String>{};
 
     for (final url in urls) {
       try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 12));
-        if (res.statusCode == 200) {
-          final lines = res.body.split('\n');
-          for (var l in lines) {
-            l = l.trim().toLowerCase();
-            if (l.isEmpty || l.startsWith('#') || l.startsWith('!')) continue;
+        final client = http.Client();
+        final req = await client.send(http.Request('GET', Uri.parse(url)));
+        if (req.statusCode == 200) {
+          await req.stream
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())
+              .forEach((line) {
+            var l = line.trim().toLowerCase();
+            if (l.isNotEmpty && !l.startsWith('#') && !l.startsWith('!')) {
+              final commentIdx = l.indexOf('#');
+              if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
 
-            // Удаляем комментарии в конце строки
-            final commentIdx = l.indexOf('#');
-            if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
-
-            // Парсинг hosts формата (0.0.0.0 domain или 127.0.0.1 domain)
-            if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
-              final parts = l.split(RegExp(r'\s+'));
-              if (parts.length >= 2 && parts[1] != '0.0.0.0' && parts[1] != 'localhost') {
-                hostsSet.add(parts[1]);
-              }
-            } else if (l.startsWith('||') && l.endsWith('^')) {
-              // Adguard синтаксис: ||domain.com^
-              final clean = l.replaceAll('||', '').replaceAll('^', '').split('/')[0];
-              if (clean.isNotEmpty && !clean.contains('*')) {
-                hostsSet.add(clean);
+              if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
+                final parts = l.split(RegExp(r'\s+'));
+                if (parts.length >= 2) {
+                  final d = parts[1].trim();
+                  if (d != '0.0.0.0' && d != 'localhost' && d.contains('.')) {
+                    hostsSet.add(d);
+                  }
+                }
+              } else if (!l.contains(' ') && l.contains('.')) {
+                hostsSet.add(l);
               }
             }
-          }
+          });
         }
+        client.close();
       } catch (_) {}
     }
 
-    // Добавляем железные правила мобильных баннеров и Google/Yandex SDK вручную
     hostsSet.addAll([
       'googleads.g.doubleclick.net',
       'pagead2.googlesyndication.com',
@@ -299,11 +297,16 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       'adcolony.com',
       'vungle.com',
       'chartboost.com',
-      'ironsrc.com'
+      'ironsrc.com',
     ]);
 
     if (hostsSet.isNotEmpty) {
-      await file.writeAsString(hostsSet.join('\n'));
+      final sink = file.openWrite();
+      for (final h in hostsSet) {
+        sink.writeln(h);
+      }
+      await sink.close();
+
       if (mounted) {
         setState(() => _rulesCount = hostsSet.length);
       }
@@ -357,7 +360,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               _showToast('Обновление баз...');
               final file = await _getRulesFile();
               await _downloadEnhancedRules(file);
-              _showToast('Загружено $_rulesCount правил');
+              _showToast('Готово: $_rulesCount правил');
             },
           ),
           IconButton(
@@ -429,7 +432,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               onChanged: (v) => setState(() => _searchFilter = v),
               style: const TextStyle(fontSize: 12),
               decoration: InputDecoration(
-                hintText: 'Поиск по реальным пакетам...',
+                hintText: 'Поиск по пакетам...',
                 hintStyle: TextStyle(color: Colors.grey[600], fontSize: 12),
                 prefixIcon: const Icon(Icons.search_rounded, size: 18),
                 filled: true,
@@ -445,7 +448,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                 ? Center(
                     child: Text(
                       _logs.isEmpty
-                          ? (_isActive ? 'Ожидание сетевых DNS-пакетов из Android...' : 'Включите защиту')
+                          ? (_isActive ? 'Ожидание пакетов...' : 'Включите защиту')
                           : 'Ничего не найдено',
                       style: TextStyle(color: Colors.grey[600], fontSize: 12),
                     ),
@@ -543,7 +546,7 @@ class _WhitelistViewState extends State<WhitelistView> {
     final f = await _getWlFile();
     if (await f.exists()) {
       final l = await f.readAsLines();
-      setState(() => _items.addAll(l));
+      if (mounted) setState(() => _items.addAll(l));
     }
   }
 
@@ -594,7 +597,7 @@ class _WhitelistViewState extends State<WhitelistView> {
           ),
           Expanded(
             child: _items.isEmpty
-                ? Center(child: Text('Список исключений пуст', style: TextStyle(color: Colors.grey[600], fontSize: 12)))
+                ? Center(child: Text('Список пуст', style: TextStyle(color: Colors.grey[600], fontSize: 12)))
                 : ListView.builder(
                     itemCount: _items.length,
                     itemBuilder: (ctx, idx) => ListTile(
@@ -631,10 +634,12 @@ class _SettingsViewState extends State<SettingsView> {
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _blockTrackers = prefs.getBool('block_trackers') ?? true;
-      _blockSdk = prefs.getBool('block_sdk') ?? true;
-    });
+    if (mounted) {
+      setState(() {
+        _blockTrackers = prefs.getBool('block_trackers') ?? true;
+        _blockSdk = prefs.getBool('block_sdk') ?? true;
+      });
+    }
   }
 
   Future<void> _setTrackers(bool val) async {
@@ -658,14 +663,14 @@ class _SettingsViewState extends State<SettingsView> {
         children: [
           SwitchListTile(
             title: const Text('Фильтрация трекеров', style: TextStyle(fontSize: 13)),
-            subtitle: Text('Блокировка сбора телеметрии и метрик', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            subtitle: Text('Блокировка телеметрии', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             value: _blockTrackers,
             activeColor: const Color(0xFF9D4EDD),
             onChanged: _setTrackers,
           ),
           SwitchListTile(
             title: const Text('Блокировка мобильных SDK', style: TextStyle(fontSize: 13)),
-            subtitle: Text('AdMob, AppLovin, UnityAds, Mintegral', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            subtitle: Text('AdMob, AppLovin, UnityAds', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             value: _blockSdk,
             activeColor: const Color(0xFF9D4EDD),
             onChanged: _setSdk,
