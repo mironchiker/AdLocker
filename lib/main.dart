@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -113,7 +114,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   static const _platform = MethodChannel('com.adlocker.app/vpn');
   static const _eventChannel = EventChannel('com.adlocker.app/dns_stream');
 
-  // Прямой URL на собранный файл правил в твоем GitHub
   static const String _serverRulesUrl =
       'https://raw.githubusercontent.com/mironchiker/AdLocker/main/rules.txt';
 
@@ -169,6 +169,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                   time: DateTime.fromMillisecondsSinceEpoch(timeMs),
                 ),
               );
+              // Ограничиваем лог 50 записями
               if (_logs.length > 50) _logs.removeLast();
             });
           }
@@ -221,8 +222,8 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка скомпилированной базы из GitHub...');
-      await _syncRulesFromServer(file);
+      _showToast('Синхронизация базы правил...');
+      await _syncRules(file);
     }
 
     try {
@@ -242,19 +243,78 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _syncRulesFromServer(File file) async {
+  Future<void> _syncRules(File file) async {
+    bool downloadedFromServer = false;
+
+    // 1. Пробуем быстро скачать готовый файл с GitHub
     try {
-      final res = await http.get(Uri.parse(_serverRulesUrl)).timeout(const Duration(seconds: 15));
-      if (res.statusCode == 200 && res.body.isNotEmpty) {
+      final res = await http.get(Uri.parse(_serverRulesUrl)).timeout(const Duration(seconds: 8));
+      if (res.statusCode == 200 && res.body.trim().isNotEmpty) {
         await file.writeAsString(res.body);
-        final lines = await file.readAsLines();
-        if (mounted) {
-          setState(() => _rulesCount = lines.length);
-        }
+        downloadedFromServer = true;
       }
-    } catch (e) {
-      debugPrint('Failed to sync rules: $e');
+    } catch (_) {}
+
+    // 2. Если на GitHub файла еще нет — резервное скачивание напрямую за 3 секунды
+    if (!downloadedFromServer) {
+      final hostsSet = <String>{};
+      try {
+        final res = await http
+            .get(Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'))
+            .timeout(const Duration(seconds: 12));
+        if (res.statusCode == 200) {
+          final lines = const LineSplitter().convert(res.body);
+          for (var l in lines) {
+            l = l.trim().toLowerCase();
+            if (l.isEmpty || l.startsWith('#')) continue;
+            final commentIdx = l.indexOf('#');
+            if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
+
+            if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
+              final parts = l.split(RegExp(r'\s+'));
+              if (parts.length >= 2) {
+                final d = parts[1].trim();
+                if (d != '0.0.0.0' && d != 'localhost' && d.contains('.')) {
+                  hostsSet.add(d);
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      hostsSet.addAll([
+        'googleads.g.doubleclick.net',
+        'pagead2.googlesyndication.com',
+        'adservice.google.com',
+        'an.yandex.ru',
+        'mc.yandex.ru',
+        'applovin.com',
+        'unityads.unity3d.com',
+      ]);
+
+      if (hostsSet.isNotEmpty) {
+        final sink = file.openWrite();
+        for (final h in hostsSet) {
+          sink.writeln(h);
+        }
+        await sink.close();
+      }
     }
+
+    if (await file.exists()) {
+      final count = await file.readAsLines().then((l) => l.length);
+      if (mounted) setState(() => _rulesCount = count);
+    }
+  }
+
+  void _clearLogsAndStats() {
+    setState(() {
+      _logs.clear();
+      _blockedCount = 0;
+      _totalQueries = 0;
+    });
+    _showToast('Логи и счётчики сброшены');
   }
 
   void _showToast(String msg, {bool isError = false}) {
@@ -298,19 +358,19 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         ),
         actions: [
           IconButton(
-            tooltip: 'Обновить правила с сервера',
+            tooltip: 'Синхронизировать правила',
             icon: const Icon(Icons.cloud_download_rounded),
             onPressed: () async {
-              _showToast('Скачивание скомпилированных правил...');
+              _showToast('Обновление правил...');
               final file = await _getRulesFile();
-              await _syncRulesFromServer(file);
-              _showToast('Готово: $_rulesCount правил');
+              await _syncRules(file);
+              _showToast('Загружено: $_rulesCount правил');
             },
           ),
           IconButton(
-            tooltip: 'Очистить лог',
+            tooltip: 'Сбросить логи и счётчики',
             icon: const Icon(Icons.delete_sweep_rounded),
-            onPressed: () => setState(() => _logs.clear()),
+            onPressed: _clearLogsAndStats,
           ),
         ],
       ),
