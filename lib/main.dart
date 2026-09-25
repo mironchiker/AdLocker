@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -7,7 +6,6 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:yandex_mobileads/mobile_ads.dart';
 
 void main() {
   runZonedGuarded(() {
@@ -96,7 +94,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.shield_rounded), label: 'ЩИТ'),
             BottomNavigationBarItem(icon: Icon(Icons.playlist_add_check_rounded), label: 'БЕЛЫЙ СПИСОК'),
-            BottomNavigationBarItem(icon: Icon(Icons.monetization_on_rounded), label: 'МОНЕТИЗАЦИЯ'),
+            BottomNavigationBarItem(icon: Icon(Icons.tune_rounded), label: 'НАСТРОЙКИ'),
           ],
         ),
       ),
@@ -114,6 +112,10 @@ class DashboardView extends StatefulWidget {
 class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserver {
   static const _platform = MethodChannel('com.adlocker.app/vpn');
   static const _eventChannel = EventChannel('com.adlocker.app/dns_stream');
+
+  // Прямой URL на собранный файл правил в твоем GitHub
+  static const String _serverRulesUrl =
+      'https://raw.githubusercontent.com/mironchiker/AdLocker/main/rules.txt';
 
   bool _isActive = false;
   bool _isLoading = false;
@@ -219,8 +221,8 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка базы (90k правил)...');
-      await _downloadFastRules(file);
+      _showToast('Загрузка скомпилированной базы из GitHub...');
+      await _syncRulesFromServer(file);
     }
 
     try {
@@ -240,65 +242,18 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _downloadFastRules(File file) async {
-    final urls = [
-      'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
-      'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt',
-    ];
-
-    final hostsSet = <String>{};
-
-    for (final url in urls) {
-      try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
-        if (res.statusCode == 200) {
-          final lines = const LineSplitter().convert(res.body);
-          for (var l in lines) {
-            l = l.trim().toLowerCase();
-            if (l.isEmpty || l.startsWith('#') || l.startsWith('!')) continue;
-
-            final commentIdx = l.indexOf('#');
-            if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
-
-            if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
-              final parts = l.split(RegExp(r'\s+'));
-              if (parts.length >= 2) {
-                final d = parts[1].trim();
-                if (d != '0.0.0.0' && d != 'localhost' && d.contains('.')) {
-                  hostsSet.add(d);
-                }
-              }
-            } else if (!l.contains(' ') && l.contains('.')) {
-              hostsSet.add(l);
-            }
-          }
+  Future<void> _syncRulesFromServer(File file) async {
+    try {
+      final res = await http.get(Uri.parse(_serverRulesUrl)).timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200 && res.body.isNotEmpty) {
+        await file.writeAsString(res.body);
+        final lines = await file.readAsLines();
+        if (mounted) {
+          setState(() => _rulesCount = lines.length);
         }
-      } catch (_) {}
-    }
-
-    hostsSet.addAll([
-      'googleads.g.doubleclick.net',
-      'pagead2.googlesyndication.com',
-      'adservice.google.com',
-      'an.yandex.ru',
-      'mc.yandex.ru',
-      'ads.admob.com',
-      'applovin.com',
-      'unityads.unity3d.com',
-      'ads.tiktok.com',
-      'adcolony.com',
-    ]);
-
-    if (hostsSet.isNotEmpty) {
-      final sink = file.openWrite();
-      for (final h in hostsSet) {
-        sink.writeln(h);
       }
-      await sink.close();
-
-      if (mounted) {
-        setState(() => _rulesCount = hostsSet.length);
-      }
+    } catch (e) {
+      debugPrint('Failed to sync rules: $e');
     }
   }
 
@@ -343,12 +298,12 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         ),
         actions: [
           IconButton(
-            tooltip: 'Обновить базу',
-            icon: const Icon(Icons.sync_rounded),
+            tooltip: 'Обновить правила с сервера',
+            icon: const Icon(Icons.cloud_download_rounded),
             onPressed: () async {
-              _showToast('Скачивание 90k правил...');
+              _showToast('Скачивание скомпилированных правил...');
               final file = await _getRulesFile();
-              await _downloadFastRules(file);
+              await _syncRulesFromServer(file);
               _showToast('Готово: $_rulesCount правил');
             },
           ),
@@ -612,111 +567,59 @@ class SettingsView extends StatefulWidget {
 }
 
 class _SettingsViewState extends State<SettingsView> {
-  static const String _yandexBlockId = 'R-M-20111481-1';
-
-  BannerAd? _bannerAd;
-  bool _isBannerLoaded = false;
-  String _adStatus = 'Нажмите кнопку для проверки монетизации';
+  bool _blockTrackers = true;
+  bool _blockSdk = true;
 
   @override
-  void dispose() {
-    _bannerAd?.destroy();
-    super.dispose();
+  void initState() {
+    super.initState();
+    _loadPrefs();
   }
 
-  void _loadYandexAd() {
-    setState(() {
-      _adStatus = 'Запрос баннера R-M-20111481-1...';
-      _isBannerLoaded = false;
-    });
+  Future<void> _loadPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _blockTrackers = prefs.getBool('block_trackers') ?? true;
+        _blockSdk = prefs.getBool('block_sdk') ?? true;
+      });
+    }
+  }
 
-    _bannerAd?.destroy();
+  Future<void> _setTrackers(bool val) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('block_trackers', val);
+    setState(() => _blockTrackers = val);
+  }
 
-    final size = BannerAdSize.sticky(width: 320);
-    _bannerAd = BannerAd(
-      adUnitId: _yandexBlockId,
-      adSize: size,
-      adRequest: const AdRequest(),
-      onAdLoaded: () {
-        if (mounted) {
-          setState(() {
-            _isBannerLoaded = true;
-            _adStatus = 'Баннер показан! Доход зачисляется в РСЯ.';
-          });
-        }
-      },
-      onAdFailedToLoad: (error) {
-        if (mounted) {
-          setState(() {
-            _isBannerLoaded = false;
-            _adStatus = 'Заблокировано синхоулом либо ещё на модерации в РСЯ.';
-          });
-        }
-      },
-    );
-
-    _bannerAd?.loadAd();
+  Future<void> _setSdk(bool val) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('block_sdk', val);
+    setState(() => _blockSdk = val);
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('МОНЕТИЗАЦИЯ И ТЕСТ')),
+      appBar: AppBar(title: const Text('НАСТРОЙКИ ДВИЖКА')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: Theme.of(context).cardColor,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFFFC3F1D).withAlpha(120)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.monetization_on_rounded, color: Color(0xFFFC3F1D), size: 22),
-                    SizedBox(width: 8),
-                    Text('БАННЕР РСЯ (R-M-20111481-1)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Доход зачисляется в рублях на баланс кабинета РСЯ. При отключенном щите баннер загружается, при активном — синхоулится.',
-                  style: TextStyle(color: Colors.grey[400], fontSize: 11),
-                ),
-                const SizedBox(height: 12),
-                ElevatedButton.icon(
-                  onPressed: _loadYandexAd,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFFC3F1D),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  ),
-                  icon: const Icon(Icons.refresh_rounded, color: Colors.white),
-                  label: const Text('Загрузить баннер Яндекса', style: TextStyle(color: Colors.white, fontSize: 12)),
-                ),
-                const SizedBox(height: 12),
-                Text(_adStatus, style: TextStyle(color: _isBannerLoaded ? const Color(0xFF00FF66) : Colors.amberAccent, fontSize: 11)),
-                const SizedBox(height: 12),
-                if (_isBannerLoaded && _bannerAd != null)
-                  Center(
-                    child: Container(
-                      width: 320,
-                      height: 50,
-                      decoration: BoxDecoration(
-                        color: Colors.black26,
-                        border: Border.all(color: Colors.white12),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: AdWidget(bannerAd: _bannerAd!),
-                    ),
-                  ),
-              ],
-            ),
+          SwitchListTile(
+            title: const Text('Фильтрация трекеров', style: TextStyle(fontSize: 13)),
+            subtitle: Text('Блокировка сбора телеметрии и аналитики', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            value: _blockTrackers,
+            activeColor: const Color(0xFF9D4EDD),
+            onChanged: _setTrackers,
           ),
-          const SizedBox(height: 20),
+          SwitchListTile(
+            title: const Text('Блокировка мобильных сетей', style: TextStyle(fontSize: 13)),
+            subtitle: Text('AdMob, AppLovin, UnityAds, Яндекс Директ', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+            value: _blockSdk,
+            activeColor: const Color(0xFF9D4EDD),
+            onChanged: _setSdk,
+          ),
+          const Divider(color: Colors.white12, height: 30),
           ListTile(
             title: const Text('Основной Upstream DNS', style: TextStyle(fontSize: 13)),
             subtitle: Text('xbox-dns.ru (111.88.96.50)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
