@@ -169,7 +169,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                   time: DateTime.fromMillisecondsSinceEpoch(timeMs),
                 ),
               );
-              // Ограничиваем лог 50 записями
               if (_logs.length > 50) _logs.removeLast();
             });
           }
@@ -188,8 +187,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     int count = 0;
     if (await file.exists()) {
       try {
-        final lines = await file.readAsLines();
-        count = lines.length;
+        count = await _countLinesInFile(file);
       } catch (_) {}
     }
 
@@ -206,6 +204,16 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     }
   }
 
+  Future<int> _countLinesInFile(File file) async {
+    int lines = 0;
+    await file
+        .openRead()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .forEach((_) => lines++);
+    return lines;
+  }
+
   Future<void> _toggleProtection() async {
     if (_isLoading) return;
 
@@ -213,8 +221,15 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       try {
         await _platform.invokeMethod('stopVpn');
       } catch (_) {}
-      setState(() => _isActive = false);
-      _showToast('Защита выключена');
+
+      // Очищаем только лог сессии и счетчики запросов. ПРАВИЛА НЕ ТРОГАЕМ.
+      setState(() {
+        _isActive = false;
+        _logs.clear();
+        _blockedCount = 0;
+        _totalQueries = 0;
+      });
+      _showToast('Защита выключена. Логи очищены');
       return;
     }
 
@@ -222,7 +237,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Синхронизация базы правил...');
+      _showToast('Загрузка базы правил...');
       await _syncRules(file);
     }
 
@@ -244,26 +259,25 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   }
 
   Future<void> _syncRules(File file) async {
-    bool downloadedFromServer = false;
+    bool success = false;
 
-    // 1. Пробуем быстро скачать готовый файл с GitHub
     try {
       final res = await http.get(Uri.parse(_serverRulesUrl)).timeout(const Duration(seconds: 8));
       if (res.statusCode == 200 && res.body.trim().isNotEmpty) {
         await file.writeAsString(res.body);
-        downloadedFromServer = true;
+        success = true;
       }
     } catch (_) {}
 
-    // 2. Если на GitHub файла еще нет — резервное скачивание напрямую за 3 секунды
-    if (!downloadedFromServer) {
-      final hostsSet = <String>{};
+    if (!success) {
       try {
         final res = await http
             .get(Uri.parse('https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'))
-            .timeout(const Duration(seconds: 12));
-        if (res.statusCode == 200) {
+            .timeout(const Duration(seconds: 15));
+
+        if (res.statusCode == 200 && res.body.isNotEmpty) {
           final lines = const LineSplitter().convert(res.body);
+          final sink = file.openWrite();
           for (var l in lines) {
             l = l.trim().toLowerCase();
             if (l.isEmpty || l.startsWith('#')) continue;
@@ -275,46 +289,50 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               if (parts.length >= 2) {
                 final d = parts[1].trim();
                 if (d != '0.0.0.0' && d != 'localhost' && d.contains('.')) {
-                  hostsSet.add(d);
+                  sink.writeln(d);
                 }
               }
             }
           }
+          await sink.close();
+          success = true;
         }
       } catch (_) {}
+    }
 
-      hostsSet.addAll([
+    if (!success && (!await file.exists() || (await file.length()) == 0)) {
+      final sink = file.openWrite();
+      final emergency = [
         'googleads.g.doubleclick.net',
         'pagead2.googlesyndication.com',
         'adservice.google.com',
         'an.yandex.ru',
         'mc.yandex.ru',
+        'ads.admob.com',
         'applovin.com',
         'unityads.unity3d.com',
-      ]);
-
-      if (hostsSet.isNotEmpty) {
-        final sink = file.openWrite();
-        for (final h in hostsSet) {
-          sink.writeln(h);
-        }
-        await sink.close();
+        'ads.tiktok.com',
+        'adcolony.com',
+      ];
+      for (final e in emergency) {
+        sink.writeln(e);
       }
+      await sink.close();
     }
 
     if (await file.exists()) {
-      final count = await file.readAsLines().then((l) => l.length);
+      final count = await _countLinesInFile(file);
       if (mounted) setState(() => _rulesCount = count);
     }
   }
 
-  void _clearLogsAndStats() {
+  void _clearLogsOnly() {
     setState(() {
       _logs.clear();
       _blockedCount = 0;
       _totalQueries = 0;
     });
-    _showToast('Логи и счётчики сброшены');
+    _showToast('Логи и счётчики запросов очищены');
   }
 
   void _showToast(String msg, {bool isError = false}) {
@@ -361,16 +379,16 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
             tooltip: 'Синхронизировать правила',
             icon: const Icon(Icons.cloud_download_rounded),
             onPressed: () async {
-              _showToast('Обновление правил...');
+              _showToast('Обновление базы...');
               final file = await _getRulesFile();
               await _syncRules(file);
-              _showToast('Загружено: $_rulesCount правил');
+              _showToast('Правил в базе: $_rulesCount');
             },
           ),
           IconButton(
-            tooltip: 'Сбросить логи и счётчики',
+            tooltip: 'Очистить логи',
             icon: const Icon(Icons.delete_sweep_rounded),
-            onPressed: _clearLogsAndStats,
+            onPressed: _clearLogsOnly,
           ),
         ],
       ),
