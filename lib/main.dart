@@ -132,26 +132,95 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _loadInitialData();
+    _loadSavedStateAndRules();
     _startNativeStreamListener();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    final wasForeground = _isForeground;
     _isForeground = (state == AppLifecycleState.resumed);
+
+    // Развернули приложение — обновляем UI всеми новыми логами из фона
+    if (!wasForeground && _isForeground && mounted) {
+      setState(() {});
+    }
+
+    // Свернули приложение — сохраняем логи и счётчики на диск
+    if (state == AppLifecycleState.paused) {
+      _saveStateToDisk();
+    }
   }
 
   @override
   void dispose() {
+    _saveStateToDisk();
     _dnsSubscription?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
+  Future<void> _loadSavedStateAndRules() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final savedTotal = prefs.getInt('saved_total_queries') ?? 0;
+    final savedBlocked = prefs.getInt('saved_blocked_count') ?? 0;
+    final savedLogsJson = prefs.getStringList('saved_dns_logs') ?? [];
+
+    final restoredLogs = <DnsLogEntry>[];
+    for (final raw in savedLogsJson) {
+      try {
+        final Map<String, dynamic> data = jsonDecode(raw);
+        restoredLogs.add(DnsLogEntry(
+          domain: data['d'] ?? '',
+          blocked: data['b'] == true,
+          time: DateTime.fromMillisecondsSinceEpoch(data['t'] ?? 0),
+        ));
+      } catch (_) {}
+    }
+
+    final file = await _getRulesFile();
+    int count = 0;
+    if (await file.exists()) {
+      try {
+        count = await _countLinesInFile(file);
+      } catch (_) {}
+    }
+
+    bool running = false;
+    try {
+      running = await _platform.invokeMethod('isVpnActive') ?? false;
+    } catch (_) {}
+
+    if (mounted) {
+      setState(() {
+        _isActive = running;
+        _rulesCount = count;
+        _totalQueries = savedTotal;
+        _blockedCount = savedBlocked;
+        _logs.addAll(restoredLogs);
+      });
+    }
+  }
+
+  Future<void> _saveStateToDisk() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('saved_total_queries', _totalQueries);
+    await prefs.setInt('saved_blocked_count', _blockedCount);
+
+    final rawList = _logs.take(50).map((e) => jsonEncode({
+      'd': e.domain,
+      'b': e.blocked,
+      't': e.time.millisecondsSinceEpoch,
+    })).toList();
+
+    await prefs.setStringList('saved_dns_logs', rawList);
+  }
+
   void _startNativeStreamListener() {
     _dnsSubscription = _eventChannel.receiveBroadcastStream().listen((dynamic event) {
       if (event is Map) {
-        final domain = event['domain']?.toString() ?? '';
+        final domain = event['domain']?.toString().trim() ?? '';
         final blocked = event['blocked'] == true;
         final timeMs = (event['time'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
 
@@ -159,18 +228,23 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           _totalQueries++;
           if (blocked) _blockedCount++;
 
+          // Логи собираются всегда, даже в фоновом режиме
+          final isDuplicate = _logs.isNotEmpty && _logs.first.domain == domain;
+          if (!isDuplicate) {
+            _logs.insert(
+              0,
+              DnsLogEntry(
+                domain: domain,
+                blocked: blocked,
+                time: DateTime.fromMillisecondsSinceEpoch(timeMs),
+              ),
+            );
+            if (_logs.length > 50) _logs.removeLast();
+          }
+
+          // Перерисовка интерфейса только если экран активен
           if (_isForeground && mounted) {
-            setState(() {
-              _logs.insert(
-                0,
-                DnsLogEntry(
-                  domain: domain,
-                  blocked: blocked,
-                  time: DateTime.fromMillisecondsSinceEpoch(timeMs),
-                ),
-              );
-              if (_logs.length > 50) _logs.removeLast();
-            });
+            setState(() {});
           }
         }
       }
@@ -180,28 +254,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   Future<File> _getRulesFile() async {
     final dir = await getApplicationDocumentsDirectory();
     return File('${dir.path}/adblock_hosts_rules.txt');
-  }
-
-  Future<void> _loadInitialData() async {
-    final file = await _getRulesFile();
-    int count = 0;
-    if (await file.exists()) {
-      try {
-        count = await _countLinesInFile(file);
-      } catch (_) {}
-    }
-
-    try {
-      final bool running = await _platform.invokeMethod('isVpnActive') ?? false;
-      if (mounted) {
-        setState(() {
-          _isActive = running;
-          _rulesCount = count;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => _rulesCount = count);
-    }
   }
 
   Future<int> _countLinesInFile(File file) async {
@@ -222,13 +274,19 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         await _platform.invokeMethod('stopVpn');
       } catch (_) {}
 
-      // Очищаем только лог сессии и счетчики запросов. ПРАВИЛА НЕ ТРОГАЕМ.
+      // При выключении очищаются только сессионные логи и счётчики. База правил сохраняется!
       setState(() {
         _isActive = false;
         _logs.clear();
         _blockedCount = 0;
         _totalQueries = 0;
       });
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('saved_total_queries');
+      await prefs.remove('saved_blocked_count');
+      await prefs.remove('saved_dns_logs');
+
       _showToast('Защита выключена. Логи очищены');
       return;
     }
@@ -326,13 +384,19 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     }
   }
 
-  void _clearLogsOnly() {
+  void _clearLogsOnly() async {
     setState(() {
       _logs.clear();
       _blockedCount = 0;
       _totalQueries = 0;
     });
-    _showToast('Логи и счётчики запросов очищены');
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('saved_total_queries');
+    await prefs.remove('saved_blocked_count');
+    await prefs.remove('saved_dns_logs');
+
+    _showToast('Логи и счётчики очищены');
   }
 
   void _showToast(String msg, {bool isError = false}) {
