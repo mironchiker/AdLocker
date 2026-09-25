@@ -219,7 +219,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка скоростной базы (90k правил)...');
+      _showToast('Загрузка базы (90k правил)...');
       await _downloadFastRules(file);
     }
 
@@ -614,26 +614,28 @@ class SettingsView extends StatefulWidget {
 class _SettingsViewState extends State<SettingsView> {
   static const String _yandexBlockId = 'R-M-20111481-1';
 
-  late final Future<BannerAdSize> _adSizeFuture;
-  late BannerAd _bannerAd;
+  BannerAd? _bannerAd;
   bool _isBannerLoaded = false;
   String _adStatus = 'Нажмите кнопку для проверки монетизации';
 
   @override
-  void initState() {
-    super.initState();
-    _adSizeFuture = BannerAdSize.sticky(width: 320);
+  void dispose() {
+    _bannerAd?.destroy();
+    super.dispose();
   }
 
-  void _loadYandexAd(BannerAdSize adSize) {
+  void _loadYandexAd() {
     setState(() {
       _adStatus = 'Запрос баннера R-M-20111481-1...';
       _isBannerLoaded = false;
     });
 
+    _bannerAd?.destroy();
+
+    final size = BannerAdSize.sticky(width: 320);
     _bannerAd = BannerAd(
       adUnitId: _yandexBlockId,
-      adSize: adSize,
+      adSize: size,
       adRequest: const AdRequest(),
       onAdLoaded: () {
         if (mounted) {
@@ -653,7 +655,7 @@ class _SettingsViewState extends State<SettingsView> {
       },
     );
 
-    _bannerAd.loadAd();
+    _bannerAd?.loadAd();
   }
 
   @override
@@ -686,25 +688,19 @@ class _SettingsViewState extends State<SettingsView> {
                   style: TextStyle(color: Colors.grey[400], fontSize: 11),
                 ),
                 const SizedBox(height: 12),
-                FutureBuilder<BannerAdSize>(
-                  future: _adSizeFuture,
-                  builder: (context, snapshot) {
-                    final adSize = snapshot.data;
-                    return ElevatedButton.icon(
-                      onPressed: adSize != null ? () => _loadYandexAd(adSize) : null,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFFC3F1D),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
-                      icon: const Icon(Icons.refresh_rounded, color: Colors.white),
-                      label: const Text('Загрузить баннер Яндекса', style: TextStyle(color: Colors.white, fontSize: 12)),
-                    );
-                  },
+                ElevatedButton.icon(
+                  onPressed: _loadYandexAd,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFFC3F1D),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  icon: const Icon(Icons.refresh_rounded, color: Colors.white),
+                  label: const Text('Загрузить баннер Яндекса', style: TextStyle(color: Colors.white, fontSize: 12)),
                 ),
                 const SizedBox(height: 12),
                 Text(_adStatus, style: TextStyle(color: _isBannerLoaded ? const Color(0xFF00FF66) : Colors.amberAccent, fontSize: 11)),
                 const SizedBox(height: 12),
-                if (_isBannerLoaded)
+                if (_isBannerLoaded && _bannerAd != null)
                   Center(
                     child: Container(
                       width: 320,
@@ -714,7 +710,7 @@ class _SettingsViewState extends State<SettingsView> {
                         border: Border.all(color: Colors.white12),
                         borderRadius: BorderRadius.circular(4),
                       ),
-                      child: AdWidget(bannerAd: _bannerAd),
+                      child: AdWidget(bannerAd: _bannerAd!),
                     ),
                   ),
               ],
