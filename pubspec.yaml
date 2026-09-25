@@ -13,7 +13,6 @@ dependencies:
   http: ^1.2.1
   path_provider: ^2.1.2
   shared_preferences: ^2.2.3
-  yandex_mobileads: ^7.3.0
 
 dev_dependencies:
   flutter_test:
