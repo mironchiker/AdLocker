@@ -141,12 +141,10 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     final wasForeground = _isForeground;
     _isForeground = (state == AppLifecycleState.resumed);
 
-    // Развернули приложение — обновляем UI всеми новыми логами из фона
     if (!wasForeground && _isForeground && mounted) {
       setState(() {});
     }
 
-    // Свернули приложение — сохраняем логи и счётчики на диск
     if (state == AppLifecycleState.paused) {
       _saveStateToDisk();
     }
@@ -225,12 +223,12 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         final timeMs = (event['time'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
 
         if (domain.isNotEmpty) {
-          _totalQueries++;
-          if (blocked) _blockedCount++;
-
-          // Логи собираются всегда, даже в фоновом режиме
           final isDuplicate = _logs.isNotEmpty && _logs.first.domain == domain;
+
           if (!isDuplicate) {
+            _totalQueries++;
+            if (blocked) _blockedCount++;
+
             _logs.insert(
               0,
               DnsLogEntry(
@@ -240,11 +238,10 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               ),
             );
             if (_logs.length > 50) _logs.removeLast();
-          }
 
-          // Перерисовка интерфейса только если экран активен
-          if (_isForeground && mounted) {
-            setState(() {});
+            if (_isForeground && mounted) {
+              setState(() {});
+            }
           }
         }
       }
@@ -274,7 +271,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         await _platform.invokeMethod('stopVpn');
       } catch (_) {}
 
-      // При выключении очищаются только сессионные логи и счётчики. База правил сохраняется!
       setState(() {
         _isActive = false;
         _logs.clear();
