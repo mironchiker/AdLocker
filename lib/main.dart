@@ -7,10 +7,16 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:yandex_mobileads/mobile_ads.dart';
 
 void main() {
-  runZonedGuarded(() {
+  runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
+    try {
+      await MobileAds.initialize();
+    } catch (e) {
+      debugPrint('Yandex Ads Init Error: $e');
+    }
     runApp(const AdLockerApp());
   }, (error, stack) {
     debugPrint('AdLocker Error: $error');
@@ -95,7 +101,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> {
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.shield_rounded), label: 'ЩИТ'),
             BottomNavigationBarItem(icon: Icon(Icons.playlist_add_check_rounded), label: 'БЕЛЫЙ СПИСОК'),
-            BottomNavigationBarItem(icon: Icon(Icons.tune_rounded), label: 'ОПЦИИ'),
+            BottomNavigationBarItem(icon: Icon(Icons.monetization_on_rounded), label: 'МОНЕТИЗАЦИЯ'),
           ],
         ),
       ),
@@ -119,7 +125,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
   int _blockedCount = 0;
   int _totalQueries = 0;
   int _rulesCount = 0;
-  bool _isAppInForeground = true;
+  bool _isForeground = true;
 
   StreamSubscription? _dnsSubscription;
   final List<DnsLogEntry> _logs = [];
@@ -135,7 +141,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _isAppInForeground = (state == AppLifecycleState.resumed);
+    _isForeground = (state == AppLifecycleState.resumed);
   }
 
   @override
@@ -156,8 +162,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           _totalQueries++;
           if (blocked) _blockedCount++;
 
-          // Обновляем список и UI только если экран активен
-          if (_isAppInForeground && mounted) {
+          if (_isForeground && mounted) {
             setState(() {
               _logs.insert(
                 0,
@@ -167,11 +172,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                   time: DateTime.fromMillisecondsSinceEpoch(timeMs),
                 ),
               );
-
-              // Жесткий лимит на 80 элементов для экономии ОЗУ
-              if (_logs.length > 80) {
-                _logs.removeRange(80, _logs.length);
-              }
+              if (_logs.length > 50) _logs.removeLast();
             });
           }
         }
@@ -215,7 +216,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         await _platform.invokeMethod('stopVpn');
       } catch (_) {}
       setState(() => _isActive = false);
-      _showToast('Фильтрация остановлена');
+      _showToast('Защита выключена');
       return;
     }
 
@@ -223,8 +224,8 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
     final file = await _getRulesFile();
     if (!await file.exists() || _rulesCount == 0) {
-      _showToast('Загрузка баз (StevenBlack, OISD, HaGeZi)...');
-      await _downloadEnhancedRules(file);
+      _showToast('Загрузка скоростной базы (90k правил)...');
+      await _downloadFastRules(file);
     }
 
     try {
@@ -235,6 +236,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           _isActive = started ?? false;
         });
       }
+      if (_isActive) _showToast('Синхоул активен');
     } catch (e) {
       if (mounted) {
         setState(() => _isLoading = false);
@@ -243,47 +245,45 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
     }
   }
 
-  Future<void> _downloadEnhancedRules(File file) async {
+  Future<void> _downloadFastRules(File file) async {
     final urls = [
+      // 1. Проверенная база Стивена Блэка (~77k)
       'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
-      'https://big.oisd.nl',
-      'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt',
+      // 2. Оптимизированный плоский лист HaGeZi Light (~15k)
+      'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt',
     ];
 
     final hostsSet = <String>{};
 
     for (final url in urls) {
       try {
-        final client = http.Client();
-        final req = await client.send(http.Request('GET', Uri.parse(url)));
-        if (req.statusCode == 200) {
-          await req.stream
-              .transform(utf8.decoder)
-              .transform(const LineSplitter())
-              .forEach((line) {
-            var l = line.trim().toLowerCase();
-            if (l.isNotEmpty && !l.startsWith('#') && !l.startsWith('!')) {
-              final commentIdx = l.indexOf('#');
-              if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
+        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
+        if (res.statusCode == 200) {
+          final lines = const LineSplitter().convert(res.body);
+          for (var l in lines) {
+            l = l.trim().toLowerCase();
+            if (l.isEmpty || l.startsWith('#') || l.startsWith('!')) continue;
 
-              if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
-                final parts = l.split(RegExp(r'\s+'));
-                if (parts.length >= 2) {
-                  final d = parts[1].trim();
-                  if (d != '0.0.0.0' && d != 'localhost' && d.contains('.')) {
-                    hostsSet.add(d);
-                  }
+            final commentIdx = l.indexOf('#');
+            if (commentIdx != -1) l = l.substring(0, commentIdx).trim();
+
+            if (l.startsWith('0.0.0.0 ') || l.startsWith('127.0.0.1 ')) {
+              final parts = l.split(RegExp(r'\s+'));
+              if (parts.length >= 2) {
+                final d = parts[1].trim();
+                if (d != '0.0.0.0' && d != 'localhost' && d.contains('.')) {
+                  hostsSet.add(d);
                 }
-              } else if (!l.contains(' ') && l.contains('.')) {
-                hostsSet.add(l);
               }
+            } else if (!l.contains(' ') && l.contains('.')) {
+              hostsSet.add(l);
             }
-          });
+          }
         }
-        client.close();
       } catch (_) {}
     }
 
+    // Жесткие правила для мобильных сетей
     hostsSet.addAll([
       'googleads.g.doubleclick.net',
       'pagead2.googlesyndication.com',
@@ -295,9 +295,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       'unityads.unity3d.com',
       'ads.tiktok.com',
       'adcolony.com',
-      'vungle.com',
-      'chartboost.com',
-      'ironsrc.com',
     ]);
 
     if (hostsSet.isNotEmpty) {
@@ -354,12 +351,12 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         ),
         actions: [
           IconButton(
-            tooltip: 'Обновить базы правил',
+            tooltip: 'Обновить скоростную базу',
             icon: const Icon(Icons.sync_rounded),
             onPressed: () async {
-              _showToast('Обновление баз...');
+              _showToast('Скачивание 90k правил...');
               final file = await _getRulesFile();
-              await _downloadEnhancedRules(file);
+              await _downloadFastRules(file);
               _showToast('Готово: $_rulesCount правил');
             },
           ),
@@ -404,7 +401,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
           const SizedBox(height: 10),
           Text(
             _isLoading
-                ? 'ОБНОВЛЕНИЕ БАЗЫ...'
+                ? 'ЗАГРУЗКА...'
                 : (_isActive ? 'СИНХОУЛ 0.0.0.0 АКТИВЕН' : 'ЗАЩИТА ВЫКЛЮЧЕНА'),
             style: TextStyle(
               fontWeight: FontWeight.bold,
@@ -432,7 +429,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
               onChanged: (v) => setState(() => _searchFilter = v),
               style: const TextStyle(fontSize: 12),
               decoration: InputDecoration(
-                hintText: 'Поиск по пакетам...',
+                hintText: 'Поиск по доменам...',
                 hintStyle: TextStyle(color: Colors.grey[600], fontSize: 12),
                 prefixIcon: const Icon(Icons.search_rounded, size: 18),
                 filled: true,
@@ -448,7 +445,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
                 ? Center(
                     child: Text(
                       _logs.isEmpty
-                          ? (_isActive ? 'Ожидание пакетов...' : 'Включите защиту')
+                          ? (_isActive ? 'Трафик фильтруется без задержек...' : 'Включите защиту')
                           : 'Ничего не найдено',
                       style: TextStyle(color: Colors.grey[600], fontSize: 12),
                     ),
@@ -580,7 +577,7 @@ class _WhitelistViewState extends State<WhitelistView> {
                     controller: _controller,
                     style: const TextStyle(fontSize: 12),
                     decoration: InputDecoration(
-                      hintText: 'Разрешить домен (напр: yandex.ru)',
+                      hintText: 'Разрешить домен...',
                       filled: true,
                       fillColor: const Color(0xFF130724),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
@@ -623,61 +620,102 @@ class SettingsView extends StatefulWidget {
 }
 
 class _SettingsViewState extends State<SettingsView> {
-  bool _blockTrackers = true;
-  bool _blockSdk = true;
+  // Боевой ID из кабинета РСЯ
+  static const String _yandexBlockId = 'R-M-20111481-1';
 
-  @override
-  void initState() {
-    super.initState();
-    _loadPrefs();
-  }
+  bool _isBannerLoaded = false;
+  String _adStatus = 'Нажмите для запроса баннера РСЯ';
 
-  Future<void> _loadPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (mounted) {
-      setState(() {
-        _blockTrackers = prefs.getBool('block_trackers') ?? true;
-        _blockSdk = prefs.getBool('block_sdk') ?? true;
-      });
-    }
-  }
+  void _loadYandexAd() {
+    setState(() {
+      _adStatus = 'Запрос баннера R-M-20111481-1...';
+      _isBannerLoaded = false;
+    });
 
-  Future<void> _setTrackers(bool val) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('block_trackers', val);
-    setState(() => _blockTrackers = val);
-  }
-
-  Future<void> _setSdk(bool val) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('block_sdk', val);
-    setState(() => _blockSdk = val);
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (mounted) {
+        setState(() {
+          _isBannerLoaded = true;
+          _adStatus = 'Запрос отправлен в Яндекс';
+        });
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ПАРАМЕТРЫ ДВИЖКА')),
+      appBar: AppBar(title: const Text('МОНЕТИЗАЦИЯ И ТЕСТ')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          SwitchListTile(
-            title: const Text('Фильтрация трекеров', style: TextStyle(fontSize: 13)),
-            subtitle: Text('Блокировка телеметрии', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
-            value: _blockTrackers,
-            activeColor: const Color(0xFF9D4EDD),
-            onChanged: _setTrackers,
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Theme.of(context).cardColor,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFFFC3F1D).withAlpha(120)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.monetization_on_rounded, color: Color(0xFFFC3F1D), size: 22),
+                    SizedBox(width: 8),
+                    Text('БАННЕР РСЯ (R-M-20111481-1)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Доход зачисляется в рублях на баланс кабинета РСЯ. При отключенном щите баннер загружается, при активном — синхоулится.',
+                  style: TextStyle(color: Colors.grey[400], fontSize: 11),
+                ),
+                const SizedBox(height: 12),
+                ElevatedButton.icon(
+                  onPressed: _loadYandexAd,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFFC3F1D),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  icon: const Icon(Icons.refresh_rounded, color: Colors.white),
+                  label: const Text('Загрузить баннер Яндекса', style: TextStyle(color: Colors.white, fontSize: 12)),
+                ),
+                const SizedBox(height: 12),
+                Text(_adStatus, style: TextStyle(color: _isBannerLoaded ? const Color(0xFF00FF66) : Colors.amberAccent, fontSize: 11)),
+                const SizedBox(height: 12),
+                if (_isBannerLoaded)
+                  Center(
+                    child: Container(
+                      width: 320,
+                      height: 50,
+                      decoration: BoxDecoration(
+                        color: Colors.black26,
+                        border: Border.all(color: Colors.white12),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: BannerAdWidget(
+                        adUnitId: _yandexBlockId,
+                        adSize: BannerAdSize.sticky(width: 320),
+                        onAdLoaded: () {
+                          if (mounted) {
+                            setState(() => _adStatus = 'Баннер показан! Доход зачисляется в РСЯ.');
+                          }
+                        },
+                        onAdFailedToLoad: (error) {
+                          if (mounted) {
+                            setState(() => _adStatus = 'Заблокировано синхоулом либо баннер ещё на модерации в РСЯ.');
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
-          SwitchListTile(
-            title: const Text('Блокировка мобильных SDK', style: TextStyle(fontSize: 13)),
-            subtitle: Text('AdMob, AppLovin, UnityAds', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
-            value: _blockSdk,
-            activeColor: const Color(0xFF9D4EDD),
-            onChanged: _setSdk,
-          ),
-          const Divider(color: Colors.white12, height: 30),
+          const SizedBox(height: 20),
           ListTile(
-            title: const Text('Основной Upstream', style: TextStyle(fontSize: 13)),
+            title: const Text('Основной Upstream DNS', style: TextStyle(fontSize: 13)),
             subtitle: Text('xbox-dns.ru (111.88.96.50)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             trailing: const Icon(Icons.dns_rounded, color: Color(0xFF00E5FF)),
           ),
