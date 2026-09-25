@@ -10,13 +10,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:yandex_mobileads/mobile_ads.dart';
 
 void main() {
-  runZonedGuarded(() async {
+  runZonedGuarded(() {
     WidgetsFlutterBinding.ensureInitialized();
-    try {
-      await MobileAds.initialize();
-    } catch (e) {
-      debugPrint('Yandex Ads Init Error: $e');
-    }
     runApp(const AdLockerApp());
   }, (error, stack) {
     debugPrint('AdLocker Error: $error');
@@ -247,9 +242,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
 
   Future<void> _downloadFastRules(File file) async {
     final urls = [
-      // 1. Проверенная база Стивена Блэка (~77k)
       'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
-      // 2. Оптимизированный плоский лист HaGeZi Light (~15k)
       'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt',
     ];
 
@@ -283,7 +276,6 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
       } catch (_) {}
     }
 
-    // Жесткие правила для мобильных сетей
     hostsSet.addAll([
       'googleads.g.doubleclick.net',
       'pagead2.googlesyndication.com',
@@ -351,7 +343,7 @@ class _DashboardViewState extends State<DashboardView> with WidgetsBindingObserv
         ),
         actions: [
           IconButton(
-            tooltip: 'Обновить скоростную базу',
+            tooltip: 'Обновить базу',
             icon: const Icon(Icons.sync_rounded),
             onPressed: () async {
               _showToast('Скачивание 90k правил...');
@@ -620,26 +612,48 @@ class SettingsView extends StatefulWidget {
 }
 
 class _SettingsViewState extends State<SettingsView> {
-  // Боевой ID из кабинета РСЯ
   static const String _yandexBlockId = 'R-M-20111481-1';
 
+  late final Future<BannerAdSize> _adSizeFuture;
+  late BannerAd _bannerAd;
   bool _isBannerLoaded = false;
-  String _adStatus = 'Нажмите для запроса баннера РСЯ';
+  String _adStatus = 'Нажмите кнопку для проверки монетизации';
 
-  void _loadYandexAd() {
+  @override
+  void initState() {
+    super.initState();
+    _adSizeFuture = BannerAdSize.sticky(width: 320);
+  }
+
+  void _loadYandexAd(BannerAdSize adSize) {
     setState(() {
       _adStatus = 'Запрос баннера R-M-20111481-1...';
       _isBannerLoaded = false;
     });
 
-    Future.delayed(const Duration(milliseconds: 300), () {
-      if (mounted) {
-        setState(() {
-          _isBannerLoaded = true;
-          _adStatus = 'Запрос отправлен в Яндекс';
-        });
-      }
-    });
+    _bannerAd = BannerAd(
+      adUnitId: _yandexBlockId,
+      adSize: adSize,
+      adRequest: const AdRequest(),
+      onAdLoaded: () {
+        if (mounted) {
+          setState(() {
+            _isBannerLoaded = true;
+            _adStatus = 'Баннер показан! Доход зачисляется в РСЯ.';
+          });
+        }
+      },
+      onAdFailedToLoad: (error) {
+        if (mounted) {
+          setState(() {
+            _isBannerLoaded = false;
+            _adStatus = 'Заблокировано синхоулом либо ещё на модерации в РСЯ.';
+          });
+        }
+      },
+    );
+
+    _bannerAd.loadAd();
   }
 
   @override
@@ -672,14 +686,20 @@ class _SettingsViewState extends State<SettingsView> {
                   style: TextStyle(color: Colors.grey[400], fontSize: 11),
                 ),
                 const SizedBox(height: 12),
-                ElevatedButton.icon(
-                  onPressed: _loadYandexAd,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFFC3F1D),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  ),
-                  icon: const Icon(Icons.refresh_rounded, color: Colors.white),
-                  label: const Text('Загрузить баннер Яндекса', style: TextStyle(color: Colors.white, fontSize: 12)),
+                FutureBuilder<BannerAdSize>(
+                  future: _adSizeFuture,
+                  builder: (context, snapshot) {
+                    final adSize = snapshot.data;
+                    return ElevatedButton.icon(
+                      onPressed: adSize != null ? () => _loadYandexAd(adSize) : null,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFFC3F1D),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      icon: const Icon(Icons.refresh_rounded, color: Colors.white),
+                      label: const Text('Загрузить баннер Яндекса', style: TextStyle(color: Colors.white, fontSize: 12)),
+                    );
+                  },
                 ),
                 const SizedBox(height: 12),
                 Text(_adStatus, style: TextStyle(color: _isBannerLoaded ? const Color(0xFF00FF66) : Colors.amberAccent, fontSize: 11)),
@@ -694,20 +714,7 @@ class _SettingsViewState extends State<SettingsView> {
                         border: Border.all(color: Colors.white12),
                         borderRadius: BorderRadius.circular(4),
                       ),
-                      child: BannerAdWidget(
-                        adUnitId: _yandexBlockId,
-                        adSize: BannerAdSize.sticky(width: 320),
-                        onAdLoaded: () {
-                          if (mounted) {
-                            setState(() => _adStatus = 'Баннер показан! Доход зачисляется в РСЯ.');
-                          }
-                        },
-                        onAdFailedToLoad: (error) {
-                          if (mounted) {
-                            setState(() => _adStatus = 'Заблокировано синхоулом либо баннер ещё на модерации в РСЯ.');
-                          }
-                        },
-                      ),
+                      child: AdWidget(bannerAd: _bannerAd),
                     ),
                   ),
               ],
