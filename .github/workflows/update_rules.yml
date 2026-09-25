@@ -2,7 +2,6 @@ name: Update Blocklist Rules
 
 on:
   schedule:
-    # Запуск каждые 12 часов (в 00:00 и 12:00 UTC)
     - cron: '0 */12 * * *'
   workflow_dispatch:
 
@@ -10,12 +9,12 @@ jobs:
   update-rules:
     name: Download, Merge & Clean Rules
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,9 +23,9 @@ jobs:
 
       - name: Download and Process Rules
         run: |
-          echo "Downloading sources on GitHub Server..."
-          curl -sL "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" > raw_steven.txt
-          curl -sL "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt" > raw_hagezi.txt
+          echo "Downloading rule sources..."
+          curl -sL "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" -o raw_steven.txt
+          curl -sL "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt" -o raw_hagezi.txt
 
           echo "Compiling clean rules..."
           python3 - << 'EOF'
@@ -55,7 +54,6 @@ jobs:
           parse_file('raw_steven.txt')
           parse_file('raw_hagezi.txt')
 
-          # Дополнительный список мобильных сетей
           mobile_networks = [
               'googleads.g.doubleclick.net',
               'pagead2.googlesyndication.com',
@@ -89,5 +87,5 @@ jobs:
             echo "No changes in rules."
           else
             git commit -m "Auto-update rules.txt [skip ci]"
-            git push
+            git push origin main
           fi
