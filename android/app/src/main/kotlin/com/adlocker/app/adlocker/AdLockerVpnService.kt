@@ -14,27 +14,36 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 class AdLockerVpnService : VpnService() {
 
     companion object {
-        var isRunning = false
-        var activeRulesCount = 0
+        @Volatile var isRunning = false
+        @Volatile var activeRulesCount = 0
         var queryListener: ((Map<String, Any>) -> Unit)? = null
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var isWorkerRunning = false
-    
-    // ConcurrentHashMap с фиктивным значением для O(1) поиска без блокировок
-    private val blackList = ConcurrentHashMap<String, Boolean>(150000)
-    private val whiteList = ConcurrentHashMap<String, Boolean>(1000)
-    
+    @Volatile private var isWorkerRunning = false
+
+    // Быстрый плоский Set: после загрузки только читается (минимальный footprint в RAM)
+    @Volatile private var blackList: Set<String> = emptySet()
+    @Volatile private var whiteList: Set<String> = emptySet()
+
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val forwarderPool = Executors.newFixedThreadPool(8)
+    private val forwarderPool = Executors.newFixedThreadPool(4)
+
+    // Переиспользуемые сокеты для каждого рабочего потока (экономия батареи и дескрипторов)
+    private val threadSocket = object : ThreadLocal<DatagramSocket>() {
+        override fun initialValue(): DatagramSocket {
+            val s = DatagramSocket()
+            protect(s)
+            s.soTimeout = 2500
+            return s
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
@@ -47,7 +56,7 @@ class AdLockerVpnService : VpnService() {
     }
 
     private fun loadRules() {
-        thread(name = "AdLocker-RulesLoader") {
+        thread(name = "AdLocker-RulesLoader", priority = Thread.MIN_PRIORITY) {
             try {
                 val candidateDirs = listOf(
                     File(filesDir, "app_flutter"),
@@ -56,51 +65,39 @@ class AdLockerVpnService : VpnService() {
                     File(filesDir.parentFile, "app_flutter")
                 )
 
-                var rulesFile: File? = null
-                for (dir in candidateDirs) {
-                    val f = File(dir, "adblock_hosts_rules.txt")
-                    if (f.exists() && f.length() > 0) {
-                        rulesFile = f
-                        break
-                    }
-                }
+                val rulesFile = candidateDirs.map { File(it, "adblock_hosts_rules.txt") }
+                    .firstOrNull { it.exists() && it.length() > 0 }
 
                 if (rulesFile != null) {
-                    blackList.clear()
-                    BufferedReader(InputStreamReader(FileInputStream(rulesFile))).use { reader ->
+                    val newSet = HashSet<String>(160000)
+                    BufferedReader(InputStreamReader(FileInputStream(rulesFile)), 32768).use { reader ->
                         var line = reader.readLine()
                         while (line != null) {
                             val trimmed = line.trim().lowercase()
                             if (trimmed.isNotEmpty() && !trimmed.startsWith("#")) {
-                                blackList[trimmed] = true
+                                newSet.add(trimmed)
                             }
                             line = reader.readLine()
                         }
                     }
-                    activeRulesCount = blackList.size
+                    blackList = newSet
+                    activeRulesCount = newSet.size
                 }
 
-                var wlFile: File? = null
-                for (dir in candidateDirs) {
-                    val f = File(dir, "whitelist.txt")
-                    if (f.exists() && f.length() > 0) {
-                        wlFile = f
-                        break
-                    }
-                }
+                val wlFile = candidateDirs.map { File(it, "whitelist.txt") }
+                    .firstOrNull { it.exists() && it.length() > 0 }
 
                 if (wlFile != null) {
-                    whiteList.clear()
-                    BufferedReader(InputStreamReader(FileInputStream(wlFile))).use { reader ->
+                    val newWl = HashSet<String>(1000)
+                    BufferedReader(InputStreamReader(FileInputStream(wlFile)), 8192).use { reader ->
                         var line = reader.readLine()
                         while (line != null) {
                             val trimmed = line.trim().lowercase()
-                            if (trimmed.isNotEmpty()) {
-                                whiteList[trimmed] = true
-                            }
+                            if (trimmed.isNotEmpty()) newWl.add(trimmed)
                             line = reader.readLine()
                         }
                     }
+                    whiteList = newWl
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -114,11 +111,9 @@ class AdLockerVpnService : VpnService() {
             val builder = Builder()
             builder.setSession("AdLocker DNS")
             builder.setMtu(1500)
-            
             builder.addAddress("10.254.1.2", 32)
             builder.addDnsServer("10.254.1.1")
             builder.addRoute("10.254.1.1", 32)
-
             builder.allowBypass()
 
             try {
@@ -139,11 +134,11 @@ class AdLockerVpnService : VpnService() {
     }
 
     private fun startDnsWorker() {
-        thread(name = "AdLocker-TunWorker") {
+        thread(name = "AdLocker-TunWorker", priority = Thread.NORM_PRIORITY) {
             val pfd = vpnInterface ?: return@thread
             val inStream = FileInputStream(pfd.fileDescriptor)
             val outStream = FileOutputStream(pfd.fileDescriptor)
-            val packetBuffer = ByteArray(32767)
+            val packetBuffer = ByteArray(4096) // 4KB для DNS пакета достаточно, вместо 32KB
 
             val upstreamXbox = InetAddress.getByName("111.88.96.50")
             val fallbackAdguard = InetAddress.getByName("94.140.14.14")
@@ -151,10 +146,15 @@ class AdLockerVpnService : VpnService() {
             while (isWorkerRunning) {
                 try {
                     val length = inStream.read(packetBuffer)
-                    if (length <= 0) continue
+                    if (length <= 0) {
+                        Thread.sleep(5)
+                        continue
+                    }
 
-                    if ((packetBuffer[0].toInt() shr 4) != 4) continue
-                    if (packetBuffer[9].toInt() != 17) continue
+                    // Проверка IPv4 (0x45) и UDP (протокол 17)
+                    if ((packetBuffer[0].toInt() shr 4) != 4 || packetBuffer[9].toInt() != 17) {
+                        continue
+                    }
 
                     val ihl = (packetBuffer[0].toInt() and 0x0F) * 4
                     val udpDstPort = ((packetBuffer[ihl + 2].toInt() and 0xFF) shl 8) or (packetBuffer[ihl + 3].toInt() and 0xFF)
@@ -164,15 +164,14 @@ class AdLockerVpnService : VpnService() {
                         val dnsLength = length - udpOffset
                         if (dnsLength < 12) continue
 
-                        val dnsQuery = ByteArray(dnsLength)
-                        System.arraycopy(packetBuffer, udpOffset, dnsQuery, 0, dnsLength)
-
-                        val domain = parseDnsDomain(dnsQuery)
+                        val domain = parseDnsDomain(packetBuffer, udpOffset, dnsLength)
                         val isBlocked = shouldBlock(domain)
 
                         notifyFlutter(domain, isBlocked)
 
                         if (isBlocked) {
+                            val dnsQuery = ByteArray(dnsLength)
+                            System.arraycopy(packetBuffer, udpOffset, dnsQuery, 0, dnsLength)
                             val dnsResponse = craftSinkholeDnsResponse(dnsQuery)
                             val fullPacket = craftUdpIpPacket(packetBuffer, ihl, dnsResponse)
                             synchronized(outStream) {
@@ -181,17 +180,16 @@ class AdLockerVpnService : VpnService() {
                         } else {
                             val packetCopy = ByteArray(length)
                             System.arraycopy(packetBuffer, 0, packetCopy, 0, length)
+                            val dnsQuery = ByteArray(dnsLength)
+                            System.arraycopy(packetBuffer, udpOffset, dnsQuery, 0, dnsLength)
 
                             forwarderPool.execute {
                                 try {
-                                    val socket = DatagramSocket()
-                                    protect(socket)
-                                    socket.soTimeout = 2000
-
+                                    val socket = threadSocket.get() ?: DatagramSocket().also { protect(it) }
                                     val outPacket = DatagramPacket(dnsQuery, dnsLength, upstreamXbox, 53)
                                     socket.send(outPacket)
 
-                                    val inBuf = ByteArray(4096)
+                                    val inBuf = ByteArray(1500)
                                     val inPacket = DatagramPacket(inBuf, inBuf.size)
                                     var received = false
 
@@ -213,12 +211,13 @@ class AdLockerVpnService : VpnService() {
                                             outStream.write(replyPacket)
                                         }
                                     }
-                                    socket.close()
                                 } catch (_: Exception) {}
                             }
                         }
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    if (!isWorkerRunning) break
+                }
             }
         }
     }
@@ -227,35 +226,33 @@ class AdLockerVpnService : VpnService() {
         if (domain.isEmpty()) return false
         val d = domain.trim().trimEnd('.').lowercase()
 
-        if (whiteList.containsKey(d)) return false
+        val currentWl = whiteList
+        if (currentWl.contains(d)) return false
 
-        // 1. Точное попадание
-        if (blackList.containsKey(d)) return true
+        val currentBl = blackList
+        if (currentBl.contains(d)) return true
 
-        // 2. Иерархический поиск поддоменов: a.b.doubleclick.net -> b.doubleclick.net -> doubleclick.net
         var dotIndex = d.indexOf('.')
         while (dotIndex != -1) {
             val parent = d.substring(dotIndex + 1)
-            if (blackList.containsKey(parent)) {
-                return true
-            }
+            if (currentBl.contains(parent)) return true
             dotIndex = d.indexOf('.', dotIndex + 1)
         }
 
         return false
     }
 
-    private fun parseDnsDomain(dns: ByteArray): String {
-        var pos = 12
-        val sb = StringBuilder()
-        while (pos < dns.size) {
-            val len = dns[pos].toInt() and 0xFF
-            if (len == 0) break
-            if ((len and 0xC0) == 0xC0) break
+    private fun parseDnsDomain(buf: ByteArray, offset: Int, length: Int): String {
+        var pos = offset + 12
+        val end = offset + length
+        val sb = StringBuilder(32)
+        while (pos < end) {
+            val len = buf[pos].toInt() and 0xFF
+            if (len == 0 || (len and 0xC0) == 0xC0) break
             pos++
-            if (pos + len > dns.size) break
+            if (pos + len > end) break
             if (sb.isNotEmpty()) sb.append(".")
-            sb.append(String(dns, pos, len, Charsets.US_ASCII))
+            sb.append(String(buf, pos, len, Charsets.US_ASCII))
             pos += len
         }
         return sb.toString()
@@ -340,8 +337,9 @@ class AdLockerVpnService : VpnService() {
     }
 
     private fun notifyFlutter(domain: String, isBlocked: Boolean) {
+        if (queryListener == null) return
         mainHandler.post {
-            val map = HashMap<String, Any>()
+            val map = HashMap<String, Any>(4)
             map["domain"] = domain
             map["blocked"] = isBlocked
             map["time"] = System.currentTimeMillis()
@@ -363,6 +361,7 @@ class AdLockerVpnService : VpnService() {
 
     override fun onDestroy() {
         stopVpn()
+        forwarderPool.shutdownNow()
         super.onDestroy()
     }
 }
