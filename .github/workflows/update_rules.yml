@@ -1,0 +1,93 @@
+name: Update Blocklist Rules
+
+on:
+  schedule:
+    # Запуск каждые 12 часов (в 00:00 и 12:00 UTC)
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-rules:
+    name: Download, Merge & Clean Rules
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Download and Process Rules
+        run: |
+          echo "Downloading sources on GitHub Server..."
+          curl -sL "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" > raw_steven.txt
+          curl -sL "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt" > raw_hagezi.txt
+
+          echo "Compiling clean rules..."
+          python3 - << 'EOF'
+          domains = set()
+
+          def parse_file(filepath):
+              try:
+                  with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                      for line in f:
+                          l = line.strip().lower()
+                          if not l or l.startswith('#') or l.startswith('!'):
+                              continue
+                          l = l.split('#')[0].strip()
+                          
+                          if l.startswith('0.0.0.0 ') or l.startswith('127.0.0.1 '):
+                              parts = l.split()
+                              if len(parts) >= 2:
+                                  d = parts[1].strip()
+                                  if d not in ('0.0.0.0', '127.0.0.1', 'localhost') and '.' in d:
+                                      domains.add(d)
+                          elif ' ' not in l and '.' in l:
+                              domains.add(l)
+              except Exception as e:
+                  print(f"Error parsing {filepath}: {e}")
+
+          parse_file('raw_steven.txt')
+          parse_file('raw_hagezi.txt')
+
+          # Дополнительный список мобильных сетей
+          mobile_networks = [
+              'googleads.g.doubleclick.net',
+              'pagead2.googlesyndication.com',
+              'adservice.google.com',
+              'an.yandex.ru',
+              'mc.yandex.ru',
+              'ads.admob.com',
+              'applovin.com',
+              'unityads.unity3d.com',
+              'ads.tiktok.com',
+              'adcolony.com'
+          ]
+          for d in mobile_networks:
+              domains.add(d)
+
+          with open('rules.txt', 'w', encoding='utf-8') as f:
+              for d in sorted(domains):
+                  f.write(f"{d}\n")
+
+          print(f"Compilation finished. Total clean rules: {len(domains)}")
+          EOF
+
+          rm -f raw_steven.txt raw_hagezi.txt
+
+      - name: Commit and Push if Changed
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add rules.txt
+          if git diff --staged --quiet; then
+            echo "No changes in rules."
+          else
+            git commit -m "Auto-update rules.txt [skip ci]"
+            git push
+          fi
