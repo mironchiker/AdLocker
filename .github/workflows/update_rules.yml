@@ -2,90 +2,115 @@ name: Update Blocklist Rules
 
 on:
   schedule:
+    # Запуск каждые 12 часов
     - cron: '0 */12 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   update-rules:
-    name: Download, Merge & Clean Rules
+    name: Build 200k-250k Optimized Rules
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      - name: Download and Process Rules
+      - name: Download and Process Rulesets
         run: |
-          echo "Downloading rule sources..."
-          curl -sL "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" -o raw_steven.txt
-          curl -sL "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt" -o raw_hagezi.txt
+          echo "Downloading curated blocklists..."
+          # 1. HaGeZi Multi PRO (~225k доменов — топовый баланс без ложных срабатываний)
+          curl -sL "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt" -o src_hagezi.txt
 
-          echo "Compiling clean rules..."
+          # 2. StevenBlack Unified (~80k доменов — классика рекламы и телеметрии)
+          curl -sL "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" -o src_steven.txt
+
+          # 3. AdGuard DNS Filter (официальный лист AdGuard)
+          curl -sL "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt" -o src_adguard.txt
+
+          # 4. Мобильная телеметрия и трекеры
+          curl -sL "https://v.firebog.net/hosts/Easyprivacy.txt" -o src_easyprivacy.txt
+
           python3 - << 'EOF'
-          domains = set()
+          import glob
+          import re
 
-          def parse_file(filepath):
+          domains = set()
+          # Строгая проверка доменного имени
+          domain_regex = re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
+
+          for filepath in glob.glob('src_*.txt'):
+              print(f"Reading {filepath}...")
               try:
                   with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                       for line in f:
                           l = line.strip().lower()
-                          if not l or l.startswith('#') or l.startswith('!'):
+                          if not l or l.startswith(('#', '!', ';', '//')):
                               continue
-                          l = l.split('#')[0].strip()
                           
-                          if l.startswith('0.0.0.0 ') or l.startswith('127.0.0.1 '):
+                          # Отрезаем комментарии в конце
+                          l = l.split('#')[0].strip()
+
+                          # Формат hosts: 0.0.0.0 domain.com или 127.0.0.1 domain.com
+                          if l.startswith(('0.0.0.0 ', '127.0.0.1 ')):
                               parts = l.split()
                               if len(parts) >= 2:
                                   d = parts[1].strip()
-                                  if d not in ('0.0.0.0', '127.0.0.1', 'localhost') and '.' in d:
+                                  if d not in ('0.0.0.0', '127.0.0.1', 'localhost', 'broadcasthost') and domain_regex.match(d):
                                       domains.add(d)
-                          elif ' ' not in l and '.' in l:
+
+                          # Формат adblock: ||domain.com^
+                          elif l.startswith('||') and l.endswith('^'):
+                              d = l[2:-1].strip()
+                              if domain_regex.match(d):
+                                  domains.add(d)
+
+                          # Простой список доменов (по одному на строку)
+                          elif ' ' not in l and '/' not in l and domain_regex.match(l):
                               domains.add(l)
               except Exception as e:
-                  print(f"Error parsing {filepath}: {e}")
+                  print(f"Error reading {filepath}: {e}")
 
-          parse_file('raw_steven.txt')
-          parse_file('raw_hagezi.txt')
-
-          mobile_networks = [
-              'googleads.g.doubleclick.net',
-              'pagead2.googlesyndication.com',
-              'adservice.google.com',
+          # Обязательные домены мобильных сетей в РФ/СНГ
+          mandatory_mobile = [
               'an.yandex.ru',
               'mc.yandex.ru',
+              'adservice.google.com',
+              'pagead2.googlesyndication.com',
+              'googleads.g.doubleclick.net',
               'ads.admob.com',
               'applovin.com',
               'unityads.unity3d.com',
               'ads.tiktok.com',
-              'adcolony.com'
+              'adcolony.com',
+              'vungle.com',
+              'ironsrc.com',
+              'chartboost.com',
+              'mytarget.ru',
+              'target.my.com'
           ]
-          for d in mobile_networks:
+          for d in mandatory_mobile:
               domains.add(d)
 
+          print(f"Total Unique Filtered Domains: {len(domains)}")
+
+          # Сохраняем готовый отсортированный файл rules.txt
           with open('rules.txt', 'w', encoding='utf-8') as f:
               for d in sorted(domains):
                   f.write(f"{d}\n")
-
-          print(f"Compilation finished. Total clean rules: {len(domains)}")
           EOF
 
-          rm -f raw_steven.txt raw_hagezi.txt
+          rm -f src_*.txt
 
-      - name: Commit and Push if Changed
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add rules.txt
-          if git diff --staged --quiet; then
-            echo "No changes in rules."
-          else
-            git commit -m "Auto-update rules.txt [skip ci]"
-            git push origin main
-          fi
+      - name: Commit and Push rules.txt
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update rules.txt (~200k-250k optimized pack) [skip ci]"
+          file_pattern: 'rules.txt'
