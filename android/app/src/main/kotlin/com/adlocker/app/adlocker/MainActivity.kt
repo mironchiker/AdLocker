@@ -2,6 +2,7 @@ package com.adlocker.app.adlocker
 
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.net.VpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -43,6 +44,15 @@ class MainActivity : FlutterActivity() {
                 }
                 "getRulesCount" -> {
                     result.success(AdLockerVpnService.activeRulesCount)
+                }
+                "openUrl" -> {
+                    val url = call.arguments as? String
+                    if (url == null) {
+                        result.error("ARGS", "Missing url", null)
+                    } else {
+                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        result.success(true)
+                    }
                 }
                 else -> result.notImplemented()
             }

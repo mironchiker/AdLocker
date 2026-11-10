@@ -8,6 +8,8 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'update.dart';
+
 void main() {
   runZonedGuarded(() {
     WidgetsFlutterBinding.ensureInitialized();
@@ -67,6 +69,19 @@ class MainNavigationScreen extends StatefulWidget {
 
 class _MainNavigationScreenState extends State<MainNavigationScreen> {
   int _currentIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdate());
+  }
+
+  Future<void> _checkForUpdate() async {
+    final info = await fetchUpdate();
+    if (info != null && mounted) {
+      showUpdateSheet(context, info);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -736,6 +751,34 @@ class _SettingsViewState extends State<SettingsView> {
     setState(() => _blockSdk = val);
   }
 
+  Widget _buildSocialLink(IconData icon, String label, String url, Color color) {
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => openExternalUrl(url),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          decoration: BoxDecoration(
+            color: Theme.of(context).cardColor,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: color.withAlpha(90)),
+          ),
+          child: Column(
+            children: [
+              CircleAvatar(
+                radius: 18,
+                backgroundColor: color,
+                child: Icon(icon, color: Colors.white, size: 20),
+              ),
+              const SizedBox(height: 8),
+              Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -767,6 +810,21 @@ class _SettingsViewState extends State<SettingsView> {
             title: const Text('Fallback DNS', style: TextStyle(fontSize: 13)),
             subtitle: Text('AdGuard (94.140.14.14)', style: TextStyle(color: Colors.grey[500], fontSize: 11)),
             trailing: const Icon(Icons.shield_moon_rounded, color: Color(0xFFC77DFF)),
+          ),
+          const Divider(color: Colors.white12, height: 30),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Text(
+              'СВЯЗЬ',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.grey[500]),
+            ),
+          ),
+          Row(
+            children: [
+              _buildSocialLink(Icons.send_rounded, 'Telegram', 'https://t.me/kinww', const Color(0xFF2AABEE)),
+              const SizedBox(width: 10),
+              _buildSocialLink(Icons.code_rounded, 'GitHub', 'https://github.com/mironchiker/AdLocker', const Color(0xFF6E40C9)),
+            ],
           ),
         ],
       ),
